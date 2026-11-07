@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: PHP ${{ matrix.php }}${{ matrix.label }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.2', '8.3', '8.4', '8.5']
+        extensions: ['mbstring, gmp, zlib']
+        label: ['']
+        include:
+          # Exercises the pure-PHP BigInt arithmetic.
+          - php: '8.5'
+            extensions: 'mbstring, zlib, :gmp'
+            label: ' without ext-gmp'
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: ${{ matrix.extensions }}
+          coverage: none
+          tools: composer:v2
+
+      - name: Validate composer.json
+        run: composer validate --strict
+
+      - name: Install dependencies
+        run: composer install --no-interaction --no-progress --prefer-dist
+
+      - name: Unit tests and conformance vectors
+        run: vendor/bin/phpunit
+
+      - name: Static analysis
+        run: vendor/bin/phpstan analyse --no-progress
+
+  codecs:
+    # The optional codecs need PHP extensions that most installations lack, so they
+    # get their own job: ext-zstd, ext-lz4 (raw block API, >= 0.8) and ext-snappy.
+    name: PHP 8.4 with zstd, lz4 and snappy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: mbstring, gmp, zlib
+          coverage: none
+          tools: composer:v2, phpize
+
+      - name: Build the codec extensions against system libraries
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libzstd-dev liblz4-dev libsnappy-dev
+          build() {
+            name=$1; url=$2; shift 2
+            mkdir -p "$RUNNER_TEMP/$name" && cd "$RUNNER_TEMP/$name"
+            curl -fsSL "$url" | tar xz --strip-components=1
+            phpize && ./configure "$@" && make -j"$(nproc)" && sudo make install
+          }
+          build zstd https://github.com/kjdev/php-ext-zstd/archive/refs/tags/0.18.0.tar.gz --with-libzstd
+          build lz4 https://github.com/kjdev/php-ext-lz4/archive/refs/tags/0.8.0.tar.gz --with-lz4-includedir=/usr
+          build snappy https://github.com/kjdev/php-ext-snappy/archive/refs/tags/0.2.3.tar.gz --with-snappy-includedir=/usr
+
+      - name: Install dependencies
+        run: composer install --no-interaction --no-progress --prefer-dist
+
+      - name: Check that the codecs are usable
+        run: |
+          # shellcheck disable=SC2016 # the single-quoted code is PHP, not shell
+          php -d extension=zstd -d extension=lz4 -d extension=snappy -r 'require "vendor/autoload.php"; foreach (["Zstd", "Lz4", "Snappy"] as $c) { if (!constant("BTOON\\Compression::$c")->isAvailable()) { fwrite(STDERR, "$c unavailable\n"); exit(1); } }'
+
+      - name: Unit tests and conformance vectors
+        run: php -d extension=zstd -d extension=lz4 -d extension=snappy vendor/bin/phpunit
