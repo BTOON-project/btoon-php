@@ -289,6 +289,21 @@ try {
 - Verify signatures on the bytes you received (that's what `hmac_key` does); don't
   re-encode and compare.
 
+## Performance
+
+10,000 records (`id`, `name`, `email`, `age`, `score`, `active`), the dataset the other
+BTOON libraries use. PHP 8.5.12 on an Apple M4 Max, best of 7 (`php bench/bench.php`):
+
+| | size | encode | decode | encode, JIT | decode, JIT |
+|---|---:|---:|---:|---:|---:|
+| `BTOON\encode` / `BTOON\decode` | 447 KB | 5.5 ms | 5.8 ms | 3.7 ms | 3.7 ms |
+| the same, `auto_tabular => false` | 767 KB | 7.3 ms | 12.3 ms | 4.8 ms | 6.0 ms |
+| `json_encode` / `json_decode` | 1,018 KB | 2.1 ms | 3.6 ms | 2.2 ms | 3.6 ms |
+
+"JIT" is `php -d opcache.enable_cli=1 -d opcache.jit=tracing -d opcache.jit_buffer_size=64M`.
+JSON is a C extension. This library is pure PHP, so it is slower than `json_*`, but the
+output is 56% smaller and byte-identical to what the C++, Python and Go libraries write.
+
 ## Development
 
 ```sh
