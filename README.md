@@ -27,17 +27,11 @@ There is no C extension: the library is plain PHP and runs anywhere PHP does.
 
 ## Installation
 
-The package is `btoon/btoon`. It is not on Packagist yet; until it is, add the
-repository to your `composer.json`:
-
-```json
-{
-    "repositories": [{ "type": "vcs", "url": "https://github.com/BTOON-project/btoon-php" }],
-    "require": { "btoon/btoon": "^0.1" }
-}
+```bash
+composer require btoon/btoon
 ```
 
-Once published, `composer require btoon/btoon` is enough.
+The package is [`btoon/btoon` on Packagist](https://packagist.org/packages/btoon/btoon).
 
 ## Quick start
 
