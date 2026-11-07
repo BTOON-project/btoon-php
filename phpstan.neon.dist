@@ -1,0 +1,11 @@
+parameters:
+    level: max
+    paths:
+        - src
+    phpVersion:
+        min: 80200
+        max: 80599
+    # Signatures of the optional compression extensions (kjdev/php-ext-*), which
+    # PHPStan doesn't ship stubs for.
+    scanFiles:
+        - stubs/compression-extensions.php

@@ -1,101 +1,29 @@
-# Composer dependencies
+# Composer (a library does not commit its lock file)
 /vendor/
 composer.lock
 
-# PHP Extension build files
-*.lo
-*.la
-*.o
-*.so
-*.dylib
-*.dll
-.libs/
-modules/
-build/
-config.h
-config.log
-config.status
-configure
-configure.ac
-autom4te.cache/
-libtool
-Makefile
-Makefile.fragments
-Makefile.global
-Makefile.objects
-run-tests.php
+# PHPUnit / coverage
+.phpunit.cache/
+.phpunit.result.cache
+/coverage/
+# Local overrides of the committed *.dist configs
+/phpunit.xml
+/phpstan.neon
 
-# IDE files
+# Python bytecode from tests/Fixtures/generate-reference-cases.py
+__pycache__/
+*.pyc
+
+# IDE and OS files
 .idea/
 .vscode/
 *.swp
 *.swo
 *~
-.vim/
-
-# OS files
 .DS_Store
 Thumbs.db
-desktop.ini
 
-# Test coverage
-coverage/
-.phpunit.result.cache
-phpunit.xml
-
-# Documentation
-/docs/_build/
-/docs/generated/
-apidoc/
-
-# Cache files
-.php-cs-fixer.cache
-.phpstan/
-.psalm/
-
-# Environment files
+# Environment and logs
 .env
 .env.local
-phpunit.xml.dist
-
-# Core submodule build
-core/build/
-core/cmake-build-*/
-
-# Temporary files
-*.tmp
-*.temp
-.tmp/
-temp/
-tmp/
-
-# Archives
-*.tar.gz
-*.zip
-*.phar
-
-# Security
-.cursor/rules/snyk_rules.mdc
-
-# Logs
 *.log
-error_log
-
-# Backup files
-*.bak
-*.backup
-*~
-
-# Test files
-tests/coverage/
-tests/.phpunit.cache/
-
-# Build artifacts
-ext/btoon/*.lo
-ext/btoon/*.la
-ext/btoon/.libs/
-ext/btoon/modules/
-
-# Package files
-btoon-*.tgz
-package.xml

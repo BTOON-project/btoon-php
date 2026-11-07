@@ -1,133 +1,77 @@
 #!/usr/bin/env php
 <?php
 
-require_once __DIR__ . '/../vendor/autoload.php';
+declare(strict_types=1);
 
-use function BTOON\encode;
+// Run from the repository root after `composer install`:  php examples/01-basic.php
+
+require __DIR__ . '/../vendor/autoload.php';
+
+use BTOON\BigInt;
+use BTOON\Binary;
+use BTOON\BtoonException;
+use BTOON\Timestamp;
+
 use function BTOON\decode;
+use function BTOON\encode;
 
-echo "BTOON PHP Basic Example\n";
-echo "========================\n\n";
+echo 'BTOON for PHP ', BTOON\VERSION, ' (spec ', BTOON\SPEC_VERSION, ")\n\n";
 
-// Simple data types
-$simpleData = [
-    'message' => 'Hello, BTOON!',
-    'count' => 42,
-    'pi' => 3.14159,
-    'active' => true,
-    'empty' => null,
-];
+// 1. Maps, lists and scalars. Keys are written in canonical (UTF-8 byte) order.
+$user = ['name' => 'Alice', 'age' => 30, 'active' => true, 'tags' => ['admin', 'dev'], 'score' => 9.5];
+$bytes = encode($user);
+printf("1. %d bytes: %s\n", strlen($bytes), bin2hex($bytes));
+var_export(decode($bytes));
+echo "\n\n";
 
-echo "1. Simple data encoding:\n";
-echo "Original: " . json_encode($simpleData) . "\n";
-
-$encoded = encode($simpleData);
-echo "Encoded size: " . strlen($encoded) . " bytes\n";
-echo "Encoded (hex): " . substr(bin2hex($encoded), 0, 50) . "...\n";
-
-$decoded = decode($encoded);
-echo "Decoded: " . json_encode($decoded) . "\n";
-
-// Verify data integrity
-assert($decoded == $simpleData, "Decode mismatch!");
-
-// Nested structures
-$nestedData = [
-    'user' => [
-        'id' => 1001,
-        'name' => 'Alice',
-        'email' => 'alice@example.com',
-        'roles' => ['admin', 'user'],
-        'settings' => [
-            'theme' => 'dark',
-            'notifications' => true,
-            'language' => 'en',
-        ],
-    ],
-    'metadata' => [
-        'created' => '2024-01-01T00:00:00Z',
-        'version' => '0.0.1',
-    ],
-];
-
-echo "\n2. Nested structure encoding:\n";
-$nestedEncoded = encode($nestedData);
-$jsonSize = strlen(json_encode($nestedData));
-$btoonSize = strlen($nestedEncoded);
-
-echo "Original size (JSON): {$jsonSize} bytes\n";
-echo "BTOON size: {$btoonSize} bytes\n";
-echo "Size reduction: " . round((1 - $btoonSize / $jsonSize) * 100) . "%\n";
-
-// Arrays of different types
-$arrayData = [
-    'numbers' => [1, 2, 3, 4, 5],
-    'strings' => ['apple', 'banana', 'cherry'],
-    'mixed' => [42, 'hello', true, null, ['key' => 'value']],
-    'matrix' => [[1, 2], [3, 4], [5, 6]],
-];
-
-echo "\n3. Array encoding:\n";
-$arrayEncoded = encode($arrayData);
-$arrayDecoded = decode($arrayEncoded);
-
-echo "Numbers preserved: " . json_encode($arrayDecoded['numbers']) . "\n";
-echo "Strings preserved: " . json_encode($arrayDecoded['strings']) . "\n";
-echo "Mixed types preserved: " . json_encode($arrayDecoded['mixed']) . "\n";
-echo "Matrix preserved: " . json_encode($arrayDecoded['matrix']) . "\n";
-
-// Binary data
-$binaryData = [
-    'id' => 'file-001',
-    'content' => 'Binary content here',
-    'checksum' => pack('C*', 0xDE, 0xAD, 0xBE, 0xEF),
-];
-
-echo "\n4. Binary data encoding:\n";
-$binaryEncoded = encode($binaryData);
-$binaryDecoded = decode($binaryEncoded);
-
-echo "Content preserved: " . $binaryDecoded['content'] . "\n";
-echo "Checksum preserved: ";
-foreach (unpack('C*', $binaryDecoded['checksum']) as $byte) {
-    printf("0x%02X ", $byte);
+// 2. Arrays of uniform records use the columnar "tabular" encoding automatically
+//    when that is smaller; they decode back to the same list of maps.
+$rows = [];
+for ($i = 1; $i <= 100; ++$i) {
+    $rows[] = ['id' => $i, 'name' => "user$i", 'email' => "user$i@example.com"];
 }
-echo "\n";
+printf(
+    "2. 100 records: %d bytes tabular, %d bytes as plain MessagePack, %d bytes of JSON\n",
+    strlen(encode($rows)),
+    strlen(encode($rows, ['auto_tabular' => false])),
+    strlen((string) json_encode($rows)),
+);
+assert(decode(encode($rows))[99]['email'] === 'user100@example.com');
 
-// Large integers
-$largeData = [
-    'small_int' => 42,
-    'large_int' => PHP_INT_MAX,
-    'float_val' => 3.14159265359,
-    'negative' => -9223372036854775808,
+// 3. Types PHP can't express directly have value classes.
+$value = [
+    'big' => new BigInt('18446744073709551616'),            // 2^64, a bigint extension
+    'blob' => new Binary("\x00\x01\x02"),                    // bytes, never a string
+    'when' => new DateTimeImmutable('2024-01-01T12:00:00.25Z'), // UTC timestamp
+    'local' => Timestamp::fromDateTime(new DateTimeImmutable('2024-01-01T14:00:00+02:00'), keepOffset: true),
 ];
+$decoded = decode(encode($value));
+printf(
+    "3. big=%s blob=0x%s when=%s local=%s\n",
+    $decoded['big'],
+    bin2hex($decoded['blob']),
+    $decoded['when']->format('Y-m-d\TH:i:s.vP'),
+    $decoded['local']->format(DATE_RFC3339),
+);
+$exact = decode(encode($value), ['timestamps' => 'object', 'binary_as_object' => true]);
+printf("   lossless: %s, %d ns\n", $exact['blob']::class, $exact['when']->nanoseconds);
 
-echo "\n5. Large number handling:\n";
-$largeEncoded = encode($largeData);
-$largeDecoded = decode($largeEncoded);
+// 4. Compression and signing: sign(compress(encode(value))).
+$key = random_bytes(32);
+$sealed = encode($rows, ['compress' => true, 'hmac_key' => $key]);
+printf("4. compressed + signed: %d bytes, starts with %s\n", strlen($sealed), substr($sealed, 0, 4));
+assert(decode($sealed, ['hmac_key' => $key]) === decode(encode($rows)));
 
-foreach ($largeDecoded as $key => $value) {
-    echo "  {$key}: {$value} (" . gettype($value) . ")\n";
-    assert($value === $largeData[$key], "Number {$key} not preserved!");
-}
-
-// Unicode and special characters
-$unicodeData = [
-    'english' => 'Hello World',
-    'chinese' => '你好世界',
-    'japanese' => 'こんにちは世界',
-    'arabic' => 'مرحبا بالعالم',
-    'emoji' => '🚀 🌟 🎉 🔥',
-    'special' => 'café, naïve, résumé',
+// 5. Errors carry the spec's machine-readable code.
+$attempts = [
+    'truncated array' => ["\x92\x01", []],
+    'tampered envelope' => [substr_replace($sealed, 'X', -1), ['hmac_key' => $key]],
+    'invalid UTF-8' => ["\xa1\xff", []],
 ];
-
-echo "\n6. Unicode handling:\n";
-$unicodeEncoded = encode($unicodeData);
-$unicodeDecoded = decode($unicodeEncoded);
-
-foreach ($unicodeDecoded as $key => $value) {
-    assert($value === $unicodeData[$key], "Unicode {$key} not preserved!");
-    echo "  {$key}: {$value} ✓\n";
+foreach ($attempts as $label => [$bad, $options]) {
+    try {
+        decode($bad, $options);
+    } catch (BtoonException $e) {
+        printf("5. %s: %s (%s)\n", $label, $e->errorCode, $e->getMessage());
+    }
 }
-
-echo "\n✅ All basic examples completed successfully!\n";
