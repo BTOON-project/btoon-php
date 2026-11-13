@@ -9,6 +9,7 @@ use BTOON\Binary;
 use BTOON\Date;
 use BTOON\DateTime;
 use BTOON\Ext;
+use BTOON\MapMode;
 use BTOON\Timestamp;
 use BTOON\VectorF32;
 use BTOON\VectorF64;
@@ -49,11 +50,15 @@ final class TypedValue
     /**
      * Compares a decoded PHP value with the expected typed value.
      *
-     * @param bool $objects whether the value was decoded with `timestamps => 'object'`
-     *                      and `binary_as_object => true`
+     * @param bool    $objects whether the value was decoded with `timestamps => 'object'`
+     *                          and `binary_as_object => true`
+     * @param MapMode $maps    the `maps` option it was decoded with: with `array`, maps
+     *                          are arrays (lists, where PHP makes them so); with `auto`,
+     *                          exactly the maps that PHP would turn into lists are
+     *                          ArrayObject; with `object`, all of them are
      * @return string|null null when equal, otherwise where and how they differ
      */
-    public static function diff(\stdClass $typed, mixed $actual, bool $objects, string $path = '$'): ?string
+    public static function diff(\stdClass $typed, mixed $actual, bool $objects, MapMode $maps = MapMode::Array, string $path = '$'): ?string
     {
         [$kind, $expected] = self::unpack($typed);
         $got = self::describe($actual);
@@ -103,7 +108,7 @@ final class TypedValue
                     return $fail(sprintf('expected a list of %d elements', \count($items)));
                 }
                 foreach ($items as $i => $item) {
-                    $diff = self::diff($item, $actual[$i], $objects, "{$path}[$i]");
+                    $diff = self::diff($item, $actual[$i], $objects, $maps, "{$path}[$i]");
                     if ($diff !== null) {
                         return $diff;
                     }
@@ -111,8 +116,20 @@ final class TypedValue
 
                 return null;
             case 'map':
-                // PHP maps are arrays; integer-like keys come back as int keys.
+                // PHP maps are arrays, and integer-like keys come back as int keys. With
+                // maps => 'auto', a map that PHP would hold as a list (empty, or keys
+                // "0"…"n-1" in order) must be an ArrayObject, so that it encodes as a map again.
                 $entries = get_object_vars(self::object($expected));
+                if ($actual instanceof \ArrayObject) {
+                    $actual = $actual->getArrayCopy();
+                    if ($maps === MapMode::Array || ($maps === MapMode::Auto && !array_is_list($actual))) {
+                        return $fail('expected an array, not an ArrayObject');
+                    }
+                } elseif ($maps === MapMode::Object) {
+                    return $fail('expected an ArrayObject');
+                } elseif ($maps === MapMode::Auto && \is_array($actual) && array_is_list($actual)) {
+                    return $fail('expected an ArrayObject, got a list (it would encode as an array)');
+                }
                 if (!\is_array($actual) || \count($actual) !== \count($entries)) {
                     return $fail(sprintf('expected a map of %d entries', \count($entries)));
                 }
@@ -123,7 +140,7 @@ final class TypedValue
                     if (!$item instanceof \stdClass) {
                         throw new \UnexpectedValueException('malformed typed map');
                     }
-                    $diff = self::diff($item, $actual[$key], $objects, "{$path}[" . var_export((string) $key, true) . ']');
+                    $diff = self::diff($item, $actual[$key], $objects, $maps, "{$path}[" . var_export((string) $key, true) . ']');
                     if ($diff !== null) {
                         return $diff;
                     }

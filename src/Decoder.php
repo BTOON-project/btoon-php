@@ -23,14 +23,22 @@ use BTOON\Internal\Runtime;
  * - nil, bool, float → `null`, `bool`, `float`
  * - integer → `int`; uint64 above PHP_INT_MAX and bigints outside int64 → {@see BigInt}
  * - str → `string`; bin → `string`, or {@see Binary} with `binary_as_object`
- * - array → list array; map → associative array; tabular → list of associative arrays
+ * - array → list array; tabular → list of maps
+ * - map → associative array, or `\ArrayObject` (see below and {@see MapMode})
  * - timestamp, date, datetime → `\DateTimeImmutable` (UTC, or the timestamp's fixed offset),
  *   or {@see Timestamp} / {@see Date} / {@see DateTime} with `timestamps => 'object'`
  * - float32/float64 vectors → {@see VectorF32} / {@see VectorF64}
  * - other extensions → {@see Ext}
  *
- * PHP turns integer-like map keys ("1", "-5") into int array keys; the encoder turns
- * them back into strings, so the round trip is lossless.
+ * PHP turns integer-like map keys ("1", "-5") into int array keys; the encoder turns them
+ * back into strings. An array whose keys are 0…n-1 in order is a list, which the encoder
+ * writes as an array. So with the default `maps => 'array'`, the maps that PHP turns into a
+ * list (the empty map, and keys "0"…"n-1" in order) re-encode as arrays. With
+ * `maps => 'auto'`, recommended and the default from 0.2.0, those maps decode to
+ * `\ArrayObject`, which the encoder writes as a map, so maps and arrays keep their type
+ * through a decode and encode round trip. Binaries and the exact timestamp types survive a
+ * round trip only with `binary_as_object` and `timestamps => 'object'`; with those and
+ * `maps => 'auto'`, encoding what strict mode decoded gives back the same value.
  */
 final class Decoder
 {
@@ -41,6 +49,10 @@ final class Decoder
     private readonly int $maxDepth;
     private readonly bool $temporalObjects;
     private readonly bool $binaryObjects;
+    /** Every map becomes an ArrayObject (`maps => 'object'`). */
+    private readonly bool $mapObjects;
+    /** Maps that PHP would turn into a list become ArrayObject (`maps => 'auto'`). */
+    private readonly bool $listLikeMapObjects;
     private readonly bool $mbstring;
 
     private string $data = '';
@@ -58,6 +70,8 @@ final class Decoder
         $this->maxDepth = $this->options->maxDepth;
         $this->temporalObjects = $this->options->timestamps === TimestampMode::Object;
         $this->binaryObjects = $this->options->binaryAsObject;
+        $this->mapObjects = $this->options->maps === MapMode::Object;
+        $this->listLikeMapObjects = $this->options->maps === MapMode::Auto;
         $this->mbstring = \function_exists('mb_check_encoding');
     }
 
@@ -194,8 +208,8 @@ final class Decoder
         return $list;
     }
 
-    /** @return array<array-key, mixed> */
-    private function map(int $count, int $depth): array
+    /** @return array<array-key, mixed>|\ArrayObject<array-key, mixed> */
+    private function map(int $count, int $depth): array|\ArrayObject
     {
         if ($depth >= $this->maxDepth) {
             throw $this->tooDeep();
@@ -203,6 +217,7 @@ final class Decoder
         if ($count > ($this->end - $this->pos) >> 1) {
             throw $this->truncated(sprintf('a map of %d entries', $count));
         }
+        /** @var array<array-key, mixed> $map integer-like keys become int keys */
         $map = [];
         for ($i = 0; $i < $count; ++$i) {
             $at = $this->pos;
@@ -212,6 +227,9 @@ final class Decoder
                 throw $this->error(ErrorCode::DuplicateKey, sprintf('duplicate map key %s', self::quote($key)), $at);
             }
             $map[$key] = $value;
+        }
+        if ($this->mapObjects || ($this->listLikeMapObjects && array_is_list($map))) {
+            return new \ArrayObject($map);
         }
 
         return $map;
@@ -351,7 +369,7 @@ final class Decoder
     /**
      * Decodes a tabular payload spanning [$start, $end) into a list of maps (SPEC §5.6.3).
      *
-     * @return list<array<array-key, mixed>>
+     * @return list<array<array-key, mixed>>|list<\ArrayObject<array-key, mixed>>
      */
     private function tabular(int $start, int $end, int $depth): array
     {
@@ -410,10 +428,13 @@ final class Decoder
         if ($columns > 0 && $rows > intdiv($end - $p, $columns)) {
             throw $this->badTable(sprintf('%d rows × %d columns do not fit in the payload', $rows, $columns));
         }
+        // Each row is created once its first cell is decoded. Building all the rows the header
+        // announces up front let nested tables count the same bytes at every level: 64
+        // levels in 1 MiB built 2 GB of empty rows (review 2026-11-13, X1).
         /** @var list<array<array-key, mixed>> $table */
-        $table = $rows > 0 ? array_fill(0, $rows, []) : [];
+        $table = [];
         $outerEnd = $this->end;
-        foreach ($names as $name) {
+        foreach ($names as $column => $name) {
             if ($end - $p < 4) {
                 throw $this->badTable('column data is truncated');
             }
@@ -426,8 +447,14 @@ final class Decoder
             $this->pos = $p;
             $this->end = $columnEnd;
             try {
-                for ($r = 0; $r < $rows; ++$r) {
-                    $table[$r][$name] = $this->value($depth + 2);
+                if ($column === 0) {
+                    for ($r = 0; $r < $rows; ++$r) {
+                        $table[] = [$name => $this->value($depth + 2)];
+                    }
+                } else {
+                    for ($r = 0; $r < $rows; ++$r) {
+                        $table[$r][$name] = $this->value($depth + 2);
+                    }
                 }
             } catch (BtoonException $e) {
                 if ($e->error === ErrorCode::Truncated) {
@@ -456,8 +483,26 @@ final class Decoder
             throw $this->badTable(sprintf('%d bytes left over after the last column', $end - $p));
         }
         $this->pos = $end;
+        // The rows are maps too, each with the column names as its keys, in column order.
+        if ($this->mapObjects || ($this->listLikeMapObjects && $rows > 0 && self::isListLike($names))) {
+            return array_map(static fn (array $row): \ArrayObject => new \ArrayObject($row), $table);
+        }
 
         return $table;
+    }
+
+    /**
+     * Whether an array with these keys, in this order, would be a list (PHP turns the keys
+     * "0", "1", … into ints).
+     *
+     * @param list<string> $keys
+     */
+    private static function isListLike(array $keys): bool
+    {
+        /** @var array<array-key, null> $array */
+        $array = array_fill_keys($keys, null);
+
+        return array_is_list($array);
     }
 
     // --- Primitive reads (all bounds-checked) ----------------------------------------
