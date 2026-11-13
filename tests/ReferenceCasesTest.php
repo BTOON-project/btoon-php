@@ -6,6 +6,7 @@ namespace BTOON\Tests;
 
 use BTOON\Binary;
 use BTOON\Ext;
+use BTOON\MapMode;
 use BTOON\Tests\Support\TypedValue;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
@@ -51,8 +52,9 @@ final class ReferenceCasesTest extends TestCase
         self::assertSame($case->hex, bin2hex(encode($value)));
         $bytes = hex2bin((string) $case->hex);
         self::assertIsString($bytes);
-        self::assertNull(TypedValue::diff($case->value, decode($bytes, ['timestamps' => 'object', 'binary_as_object' => true]), true));
-        self::assertNull(TypedValue::diff($case->value, decode($bytes), false));
+        self::assertNull(TypedValue::diff($case->value, decode($bytes, ['timestamps' => 'object', 'binary_as_object' => true]), true, MapMode::Auto));
+        self::assertNull(TypedValue::diff($case->value, decode($bytes), false, MapMode::Auto));
+        self::assertNull(TypedValue::diff($case->value, decode($bytes, ['maps' => 'array']), false, MapMode::Array));
     }
 
     private static function recipe(string $kind, int $n): mixed

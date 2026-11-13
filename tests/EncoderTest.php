@@ -261,8 +261,20 @@ final class EncoderTest extends TestCase
         self::assertSame('d401aa', self::hex(new Ext(1, "\xaa")));
         self::assertSame('c70000', self::hex(new Ext(0, '')));
         self::assertSame('d59c0102', self::hex(new Ext(-100, "\x01\x02")));
+        // The ids BTOON defines can't be written as raw extensions (SPEC §5.7).
         foreach ([-1, -2, -3, -4, -5, -6, -10] as $type) {
             $this->expectBtoonError(ErrorCode::InvalidArgument, static fn () => encode(new Ext($type, "\x00")));
+            $this->expectBtoonError(ErrorCode::InvalidArgument, static fn () => encode([new Ext($type, '')]));
+        }
+        // Every other id is written as given, including those reserved for future versions
+        // (-9…-7 and -128…-11), so that documents using them round-trip.
+        for ($type = -128; $type <= 127; ++$type) {
+            if (($type >= -6 && $type <= -1) || $type === -10) {
+                continue;
+            }
+            $bytes = encode(new Ext($type, "\x07"));
+            self::assertSame("\xd4" . \chr($type & 0xff) . "\x07", $bytes, "id $type");
+            self::assertEquals(new Ext($type, "\x07"), decode($bytes));
         }
         $this->expectBtoonError(ErrorCode::InvalidArgument, static fn () => new Ext(128, ''));
         $this->expectBtoonError(ErrorCode::InvalidArgument, static fn () => new Ext(-129, ''));
@@ -335,6 +347,15 @@ final class EncoderTest extends TestCase
         $this->expectBtoonError(ErrorCode::MaxDepth, static fn () => encode([[[null]]], ['max_depth' => 2]));
         self::assertSame('c0', bin2hex(encode(null, ['max_depth' => 0])));
         $this->expectBtoonError(ErrorCode::MaxDepth, static fn () => encode([], ['max_depth' => 0]));
+        // At most 1000 (SPEC §7).
+        self::assertSame(1000, EncodeOptions::MAX_DEPTH_LIMIT);
+        $this->expectBtoonError(ErrorCode::InvalidArgument, static fn () => new EncodeOptions(maxDepth: 1001));
+        $deep = null;
+        for ($i = 0; $i < 1000; ++$i) {
+            $deep = [$deep];
+        }
+        self::assertSame(str_repeat('91', 1000) . 'c0', bin2hex(encode($deep, ['max_depth' => 1000])));
+        $this->expectBtoonError(ErrorCode::MaxDepth, static fn () => encode([$deep], ['max_depth' => 1000]));
     }
 
     public function testTabularCountsTwoLevels(): void
@@ -398,6 +419,7 @@ final class EncoderTest extends TestCase
         yield 'algorithm not string' => [['compression' => 0]];
         yield 'negative depth' => [['max_depth' => -1]];
         yield 'depth not int' => [['max_depth' => '128']];
+        yield 'depth above 1000' => [['max_depth' => 1001]];
         yield 'empty hmac key' => [['hmac_key' => '']];
         yield 'hmac key not string' => [['hmac_key' => 123]];
     }

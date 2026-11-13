@@ -17,7 +17,9 @@ use BTOON\Internal\Runtime;
  * element counts are checked against the remaining bytes before looping, strings,
  * keys and column names must be well-formed UTF-8, duplicate keys and trailing bytes
  * are rejected (strict mode), and compression envelopes are size-limited before and
- * during decompression.
+ * during decompression. A document decodes to at most `max_values` values, and a table's
+ * rows × column-name bytes stay within `max_decompressed_size` (SPEC §7.1), which bounds
+ * the memory a decoded document takes.
  *
  * PHP type mapping:
  * - nil, bool, float → `null`, `bool`, `float`
@@ -32,13 +34,13 @@ use BTOON\Internal\Runtime;
  *
  * PHP turns integer-like map keys ("1", "-5") into int array keys; the encoder turns them
  * back into strings. An array whose keys are 0…n-1 in order is a list, which the encoder
- * writes as an array. So with the default `maps => 'array'`, the maps that PHP turns into a
- * list (the empty map, and keys "0"…"n-1" in order) re-encode as arrays. With
- * `maps => 'auto'`, recommended and the default from 0.2.0, those maps decode to
- * `\ArrayObject`, which the encoder writes as a map, so maps and arrays keep their type
- * through a decode and encode round trip. Binaries and the exact timestamp types survive a
- * round trip only with `binary_as_object` and `timestamps => 'object'`; with those and
- * `maps => 'auto'`, encoding what strict mode decoded gives back the same value.
+ * writes as an array. So with the default `maps => 'auto'`, the maps that PHP would turn
+ * into a list (the empty map, and keys "0"…"n-1" in order) decode to `\ArrayObject`, which
+ * the encoder writes as a map, and maps and arrays keep their type through a decode and
+ * encode round trip. With `maps => 'array'`, those maps decode to lists and re-encode as
+ * arrays. Binaries and the exact timestamp types survive a round trip only with
+ * `binary_as_object` and `timestamps => 'object'`; with those, encoding what strict mode
+ * decoded gives back the same value.
  */
 final class Decoder
 {
@@ -54,10 +56,16 @@ final class Decoder
     /** Maps that PHP would turn into a list become ArrayObject (`maps => 'auto'`). */
     private readonly bool $listLikeMapObjects;
     private readonly bool $mbstring;
+    /** `max_values` (SPEC §7.1). */
+    private readonly int $maxValues;
+    /** A table's rows × column-name bytes may not exceed this (`max_decompressed_size`). */
+    private readonly int $maxNameBytes;
 
     private string $data = '';
     private int $pos = 0;
     private int $end = 0;
+    /** How many more values the document may decode to. */
+    private int $valuesLeft = 0;
     /** @var array<array-key, true> keys already validated as UTF-8 during this decode */
     private array $validKeys = [];
 
@@ -73,6 +81,8 @@ final class Decoder
         $this->mapObjects = $this->options->maps === MapMode::Object;
         $this->listLikeMapObjects = $this->options->maps === MapMode::Auto;
         $this->mbstring = \function_exists('mb_check_encoding');
+        $this->maxValues = $this->options->maxValues;
+        $this->maxNameBytes = $this->options->maxDecompressedSize;
     }
 
     public function getOptions(): DecodeOptions
@@ -88,11 +98,12 @@ final class Decoder
     public function decode(string $data): mixed
     {
         $document = Envelope::open($data, $this->options);
-        $state = [$this->data, $this->pos, $this->end, $this->validKeys];
+        $state = [$this->data, $this->pos, $this->end, $this->validKeys, $this->valuesLeft];
         $this->data = $document;
         $this->pos = 0;
         $this->end = \strlen($document);
         $this->validKeys = [];
+        $this->valuesLeft = $this->maxValues;
         try {
             $value = $this->value(0);
             if ($this->pos !== $this->end && $this->strict) {
@@ -104,12 +115,17 @@ final class Decoder
 
             return $value;
         } finally {
-            [$this->data, $this->pos, $this->end, $this->validKeys] = $state;
+            [$this->data, $this->pos, $this->end, $this->validKeys, $this->valuesLeft] = $state;
         }
     }
 
     private function value(int $depth): mixed
     {
+        // A value counts when it starts, before its marker is examined and before any value
+        // inside it (SPEC §7.1).
+        if (--$this->valuesLeft < 0) {
+            throw $this->tooManyValues();
+        }
         if ($this->pos >= $this->end) {
             throw $this->truncated('a value');
         }
@@ -172,6 +188,8 @@ final class Decoder
             throw $this->truncated(sprintf('a string of %d bytes', $length));
         }
         $string = substr($this->data, $this->pos, $length);
+        // Non-strict mode skips this check for string values only; keys and column names
+        // are always checked.
         if ($this->strict && !$this->validUtf8($string)) {
             throw $this->error(ErrorCode::InvalidUtf8, 'string is not valid UTF-8');
         }
@@ -258,7 +276,9 @@ final class Decoder
             throw $this->truncated(sprintf('a map key of %d bytes', $length));
         }
         $key = substr($this->data, $this->pos, $length);
-        if ($this->strict && !isset($this->validKeys[$key])) {
+        // Keys must be UTF-8 in non-strict mode too: they compare by their bytes, and a
+        // decoder that replaced invalid sequences could merge two keys (SPEC §7).
+        if (!isset($this->validKeys[$key])) {
             if (!$this->validUtf8($key)) {
                 throw $this->error(ErrorCode::InvalidUtf8, 'map key is not valid UTF-8');
             }
@@ -396,8 +416,11 @@ final class Decoder
             throw $this->badTable(sprintf('%d columns do not fit in the payload', $columns));
         }
 
+        // Names are checked front to back (SPEC §5.6.3): each must be UTF-8, in non-strict
+        // mode too, and differ from every earlier name. The first name that fails sets the error.
         $names = [];
         $seen = [];
+        $nameBytes = 0;
         for ($c = 0; $c < $columns; ++$c) {
             if ($end - $p < 4) {
                 throw $this->badTable('column names are truncated');
@@ -408,7 +431,7 @@ final class Decoder
                 throw $this->badTable('a column name runs past the payload');
             }
             $name = substr($this->data, $p, $length);
-            if ($this->strict && !$this->validUtf8($name)) {
+            if (!$this->validUtf8($name)) {
                 $this->pos = $p;
                 throw $this->error(ErrorCode::InvalidUtf8, 'tabular column name is not valid UTF-8');
             }
@@ -417,6 +440,7 @@ final class Decoder
             }
             $seen[$name] = true;
             $names[] = $name;
+            $nameBytes += $length;
             $p += $length;
         }
         if ($end - $p < $columns) {
@@ -424,10 +448,27 @@ final class Decoder
         }
         $p += $columns; // type codes are informational (SPEC §5.6.1)
 
-        // Every cell is at least one byte, so N × C cells must fit in what's left.
+        // Then, in this order (SPEC §5.6.3): every cell is at least one byte, so N × C cells
+        // must fit in what's left;
         if ($columns > 0 && $rows > intdiv($end - $p, $columns)) {
             throw $this->badTable(sprintf('%d rows × %d columns do not fit in the payload', $rows, $columns));
         }
+        $this->pos = $p;
+        // every row holds the column names, so rows × name bytes stay within the size limit
+        // (rows > ⌊limit / bytes⌋ is rows × bytes > limit, without overflow);
+        if ($nameBytes > 0 && $rows > intdiv($this->maxNameBytes, $nameBytes)) {
+            throw $this->error(ErrorCode::SizeLimit, sprintf(
+                'tabular %d rows × %d bytes of column names exceed max_decompressed_size (%d)',
+                $rows,
+                $nameBytes,
+                $this->maxNameBytes,
+            ));
+        }
+        // and the row maps count against max_values, all together. Each cell counts as it starts.
+        if ($rows > $this->valuesLeft) {
+            throw $this->tooManyValues();
+        }
+        $this->valuesLeft -= $rows;
         // Each row is created once its first cell is decoded. Building all the rows the header
         // announces up front let nested tables count the same bytes at every level: 64
         // levels in 1 MiB built 2 GB of empty rows (review 2026-11-13, X1).
@@ -632,6 +673,14 @@ final class Decoder
     private function tooDeep(): BtoonException
     {
         return $this->error(ErrorCode::MaxDepth, sprintf('nesting deeper than max_depth (%d)', $this->maxDepth));
+    }
+
+    private function tooManyValues(): BtoonException
+    {
+        return $this->error(
+            ErrorCode::SizeLimit,
+            sprintf('the document decodes to more than max_values (%d) values', $this->maxValues),
+        );
     }
 
     private static function quote(int|string $value): string

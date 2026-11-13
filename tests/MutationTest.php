@@ -31,7 +31,7 @@ final class MutationTest extends TestCase
             new Decoder(['hmac_key' => self::KEY]),
             new Decoder(['max_depth' => 4, 'max_decompressed_size' => 4096]),
         ];
-        $seeds = array_map(Vectors::bytes(...), Vectors::all());
+        $seeds = array_map(Vectors::bytes(...), array_values(array_filter(Vectors::all(), static fn (\stdClass $v): bool => isset($v->hex))));
         // Valid zlib envelopes around mutated documents reach the decoder through decompression.
         $wrapped = [];
         foreach ($seeds as $seed) {

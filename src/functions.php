@@ -5,10 +5,10 @@ declare(strict_types=1);
 namespace BTOON;
 
 /** Version of this library. */
-const VERSION = '0.1.1';
+const VERSION = '0.2.0';
 
 /** Version of the BTOON specification this library implements. */
-const SPEC_VERSION = '0.1';
+const SPEC_VERSION = '0.2';
 
 /**
  * Encodes a PHP value as canonical BTOON.

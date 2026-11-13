@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace BTOON;
 
+use BTOON\Internal\Limits;
 use BTOON\Internal\Options;
 
 /**
@@ -15,16 +16,18 @@ use BTOON\Internal\Options;
  * | `compress`     | `compress`     | false   | wrap the output in a compression envelope (SPEC §6)      |
  * | `compression`  | `compression`  | zlib    | algorithm used when `compress` is true                   |
  * | `auto_tabular` | `autoTabular`  | true    | use the columnar encoding when the size rule says so     |
- * | `max_depth`    | `maxDepth`     | 128     | nesting limit; deeper or cyclic input raises `max_depth` |
+ * | `max_depth`    | `maxDepth`     | 128     | nesting limit (at most 1000); deeper or cyclic input raises `max_depth` |
  * | `hmac_key`     | `hmacKey`      | null    | sign the output with HMAC-SHA256 (SPEC §8)               |
  */
 final readonly class EncodeOptions
 {
     public const DEFAULT_MAX_DEPTH = 128;
+    /** The largest `max_depth` (SPEC §7); more raises `invalid_argument`. */
+    public const MAX_DEPTH_LIMIT = Limits::MAX_DEPTH;
 
     private const KEYS = ['compress', 'compression', 'auto_tabular', 'max_depth', 'hmac_key'];
 
-    /** @param non-negative-int $maxDepth */
+    /** @param non-negative-int $maxDepth at most {@see MAX_DEPTH_LIMIT} */
     public function __construct(
         public bool $compress = false,
         public Compression $compression = Compression::Zlib,

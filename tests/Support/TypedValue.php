@@ -40,8 +40,8 @@ final class TypedValue
             'timestamp' => self::timestamp(self::object($value)),
             'date' => new Date((int) self::str($value)),
             'datetime' => new DateTime((int) self::str($value)),
-            'float32_vector' => new VectorF32(array_map(self::float(...), self::stringList($value))),
-            'float64_vector' => new VectorF64(array_map(self::float(...), self::stringList($value))),
+            'float32_vector' => VectorF32::fromBytes(self::vectorBytes(self::stringList($value), 4)),
+            'float64_vector' => VectorF64::fromBytes(self::vectorBytes(self::stringList($value), 8)),
             'ext' => new Ext(self::intField(self::object($value), 'type'), self::hex(self::object($value)->data ?? '')),
             default => throw new \UnexpectedValueException("unknown typed value kind $kind"),
         };
@@ -174,11 +174,12 @@ final class TypedValue
 
                 return self::sameInstant($actual, $seconds, intdiv($rest, 1000), null) ? null : $fail("expected DateTimeImmutable for $ns ns");
             case 'float32_vector':
-                $bytes = (new VectorF32(array_map(self::float(...), self::stringList($expected))))->toBytes();
+                // Compared bit for bit, NaN payloads included.
+                $bytes = self::vectorBytes(self::stringList($expected), 4);
 
                 return $actual instanceof VectorF32 && $actual->toBytes() === $bytes ? null : $fail('expected VectorF32 0x' . bin2hex($bytes));
             case 'float64_vector':
-                $bytes = (new VectorF64(array_map(self::float(...), self::stringList($expected))))->toBytes();
+                $bytes = self::vectorBytes(self::stringList($expected), 8);
 
                 return $actual instanceof VectorF64 && $actual->toBytes() === $bytes ? null : $fail('expected VectorF64 0x' . bin2hex($bytes));
             case 'ext':
@@ -225,6 +226,36 @@ final class TypedValue
         $value = new BigInt($decimal);
 
         return $value->fitsInt() ? $value->toInt() : $value;
+    }
+
+    /**
+     * The packed little-endian bytes of float vector elements (SPEC §10): "NaN" is the
+     * canonical quiet NaN of the width (7fc00000 or 7ff8000000000000), "0x…" gives the exact
+     * bits, most significant byte first, and anything else is a decimal or ±Infinity. NaN
+     * bits are built explicitly: PHP's NAN constant doesn't promise a bit pattern.
+     *
+     * @param list<string> $elements
+     * @param 4|8          $width
+     */
+    public static function vectorBytes(array $elements, int $width): string
+    {
+        $bytes = '';
+        foreach ($elements as $text) {
+            if ($text === 'NaN') {
+                $text = $width === 4 ? '0x7fc00000' : '0x7ff8000000000000';
+            }
+            if (str_starts_with($text, '0x')) {
+                $bits = hex2bin(substr($text, 2));
+                if ($bits === false || \strlen($bits) !== $width) {
+                    throw new \UnexpectedValueException("bad $width-byte bit pattern $text");
+                }
+                $bytes .= strrev($bits);
+            } else {
+                $bytes .= pack($width === 4 ? 'g' : 'e', self::float($text));
+            }
+        }
+
+        return $bytes;
     }
 
     public static function float(string $text): float

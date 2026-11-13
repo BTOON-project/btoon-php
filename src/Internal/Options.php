@@ -33,6 +33,23 @@ final class Options
         return $value;
     }
 
+    /**
+     * A resource limit: a non-negative int, or null for the default.
+     *
+     * @return non-negative-int|null
+     */
+    public static function limit(string $name, mixed $value): ?int
+    {
+        if ($value === null) {
+            return null;
+        }
+        if (!\is_int($value) || $value < 0) {
+            throw self::invalid($name, 'a non-negative int or null', $value);
+        }
+
+        return $value;
+    }
+
     public static function hmacKey(string $name, mixed $value): ?string
     {
         if ($value === null) {
@@ -76,9 +93,16 @@ final class Options
         throw self::invalid($name, sprintf('one of %s or a %s case', $allowed, $enum), $value);
     }
 
+    /** `max_depth` is at most 1000 (SPEC §7): deeper limits could exhaust the stack. */
     public static function maxDepth(int $value): void
     {
         self::assertNonNegative('max_depth', $value);
+        if ($value > Limits::MAX_DEPTH) {
+            throw new BtoonException(
+                ErrorCode::InvalidArgument,
+                sprintf('max_depth must be at most %d, got %d', Limits::MAX_DEPTH, $value),
+            );
+        }
     }
 
     public static function assertNonNegative(string $name, int $value): void
