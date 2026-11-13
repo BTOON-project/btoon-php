@@ -14,6 +14,7 @@ use BTOON\DecodeOptions;
 use BTOON\Decoder;
 use BTOON\ErrorCode;
 use BTOON\Ext;
+use BTOON\MapMode;
 use BTOON\Timestamp;
 use BTOON\TimestampMode;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -181,6 +182,120 @@ final class DecoderTest extends TestCase
             default => self::fail(sprintf('marker 0x%02x should not decode on its own', $marker)),
         };
         self::assertSame($expected, $value);
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function mapsPhpWouldTurnIntoLists(): iterable
+    {
+        yield 'empty map' => ['80'];
+        yield '{"0": 1}' => ['81a13001'];
+        yield '{"0": 1, "1": 2}' => ['82a13001a13102'];
+        yield '{"a": {}}' => ['81a16180'];
+        yield '[{}]' => ['9180'];
+        // Ten rows of {"0": i}: enough for the tabular encoding (SPEC §5.6.2).
+        yield 'table with one column "0"' => [bin2hex(encode(array_map(static fn (int $i) => new \ArrayObject([$i]), range(0, 9))))];
+    }
+
+    /**
+     * With maps => 'auto', a map whose keys PHP would turn into a list (none, or "0"…"n-1"
+     * in order) decodes to an ArrayObject, which encodes as a map. By default these maps
+     * decode to PHP lists, so a round trip turns them into arrays (review 2026-11-13).
+     */
+    #[DataProvider('mapsPhpWouldTurnIntoLists')]
+    public function testMapsThatPhpWouldTurnIntoListsSurviveARoundTrip(string $hex): void
+    {
+        self::assertSame($hex, bin2hex(encode(decode(hex2bin($hex), ['maps' => 'auto']))));
+        self::assertSame($hex, bin2hex(encode(decode(hex2bin($hex), ['maps' => 'object']))));
+    }
+
+    public function testOnlyMapsThatPhpWouldTurnIntoListsBecomeArrayObject(): void
+    {
+        $auto = ['maps' => 'auto'];
+        $empty = decode(hex2bin('80'), $auto);
+        self::assertInstanceOf(\ArrayObject::class, $empty);
+        self::assertSame([], $empty->getArrayCopy());
+        $zero = decode(hex2bin('81a13001'), $auto);
+        self::assertInstanceOf(\ArrayObject::class, $zero);
+        self::assertSame([0 => 1], $zero->getArrayCopy());
+        // Ordinary maps stay arrays, including integer-like keys out of list order.
+        self::assertSame(['a' => 1], decode(hex2bin('81a16101'), $auto));
+        self::assertSame([1 => 2, 0 => 1], decode(hex2bin('82a13102a13001'), $auto));
+        self::assertSame(['a' => []], decode(hex2bin('81a16190'), $auto));
+        // Arrays stay lists.
+        self::assertSame([], decode(hex2bin('90'), $auto));
+        self::assertSame([1, 2], decode(hex2bin('920102'), $auto));
+        // Rows of a table whose only column is "0".
+        $rows = decode(encode(array_map(static fn (int $i) => new \ArrayObject([$i]), range(0, 9))), $auto);
+        self::assertIsArray($rows);
+        self::assertCount(10, $rows);
+        foreach ($rows as $i => $row) {
+            self::assertInstanceOf(\ArrayObject::class, $row);
+            self::assertSame([0 => $i], $row->getArrayCopy());
+        }
+    }
+
+    public function testMapsOption(): void
+    {
+        // 'object': every map is an ArrayObject, table rows included.
+        $map = decode(hex2bin('82a16101a162c0'), ['maps' => 'object']);
+        self::assertInstanceOf(\ArrayObject::class, $map);
+        self::assertSame(['a' => 1, 'b' => null], $map->getArrayCopy());
+        $records = array_map(static fn (int $i) => ['id' => $i], range(1, 10));
+        $rows = decode(encode($records), new DecodeOptions(maps: MapMode::Object));
+        self::assertIsArray($rows);
+        self::assertContainsOnlyInstancesOf(\ArrayObject::class, $rows);
+        self::assertSame($records, array_map(static fn (\ArrayObject $row) => $row->getArrayCopy(), $rows));
+        self::assertSame(bin2hex(encode($records)), bin2hex(encode($rows)));
+        // 'array': maps are always PHP arrays, so these maps come back as lists.
+        self::assertSame([], decode(hex2bin('80'), ['maps' => 'array']));
+        self::assertSame([1], decode(hex2bin('81a13001'), ['maps' => MapMode::Array]));
+        self::assertSame([[0], [1]], decode(hex2bin('92' . '81a13000' . '81a13001'), ['maps' => 'array']));
+        self::assertSame(MapMode::Auto, DecodeOptions::fromArray(['maps' => 'auto'])->maps);
+        self::assertSame(MapMode::Object, DecodeOptions::fromArray(['maps' => 'OBJECT'])->maps);
+        $this->assertDecodeError('invalid_argument', "\x01", ['maps' => 'stdclass']);
+        $this->assertDecodeError('invalid_argument', "\x01", ['maps' => true]);
+    }
+
+    /** 0.1.x keeps the 0.1.0 mapping by default: 'auto' becomes the default in 0.2.0. */
+    public function testDefaultMapModeIsStillArray(): void
+    {
+        self::assertSame(MapMode::Array, (new DecodeOptions())->maps);
+        self::assertSame(MapMode::Array, DecodeOptions::fromArray([])->maps);
+        self::assertSame(MapMode::Array, (new Decoder())->getOptions()->maps);
+        self::assertSame([], decode(hex2bin('80')));
+        self::assertSame([1], decode(hex2bin('81a13001')));
+        self::assertSame(['a' => 1], decode(hex2bin('81a16101')));
+        $rows = decode(encode(array_map(static fn (int $i) => new \ArrayObject([$i]), range(0, 9))));
+        self::assertSame(array_map(static fn (int $i) => [$i], range(0, 9)), $rows);
+        // So these maps still re-encode as arrays unless 'auto' is asked for.
+        self::assertSame('90', bin2hex(encode(decode(hex2bin('80')))));
+        self::assertSame('9101', bin2hex(encode(decode(hex2bin('81a13001')))));
+    }
+
+    /**
+     * Nested tables used to build every row they announced before decoding a cell, and
+     * each level was checked against the same remaining bytes: 64 levels in 1 MiB built
+     * 2 GB of empty rows (review 2026-11-13, X1). Rows are now created as their first cell
+     * is decoded.
+     */
+    public function testNestedTablesDoNotPreallocateRows(): void
+    {
+        $table = static function (string $cell, int $rows): string {
+            $payload = pack('NNNN', 1, 1, $rows, 1) . "a\x09" . pack('N', \strlen($cell)) . $cell;
+
+            return "\xc9" . pack('N', \strlen($payload)) . "\xf6" . $payload;
+        };
+        // The innermost table has one row holding a binary; every outer level announces as
+        // many rows as its payload could hold, but its column holds only the next level.
+        $doc = $table("\xc6" . pack('N', 128 * 1024) . str_repeat("\x00", 128 * 1024), 1);
+        for ($level = 1; $level < 64; ++$level) {
+            $doc = $table($doc, \strlen($doc) + 4);
+        }
+        $base = memory_get_usage();
+        memory_reset_peak_usage();
+        $this->assertDecodeError('invalid_tabular', $doc);
+        $peak = memory_get_peak_usage() - $base;
+        self::assertLessThan(8 * 1024 * 1024, $peak, sprintf('a %d-byte document took %d bytes', \strlen($doc), $peak));
     }
 
     public function testErrorsReportTheirByteOffset(): void

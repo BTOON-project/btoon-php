@@ -19,6 +19,7 @@ use BTOON\Internal\Options;
  * | `hmac_key`              | `hmacKey`             | null       | require and verify a signed envelope (SPEC §8)       |
  * | `timestamps`            | `timestamps`          | 'datetime' | `'datetime'` → `\DateTimeImmutable`, `'object'` → value objects |
  * | `binary_as_object`      | `binaryAsObject`      | false      | return binaries as {@see Binary} instead of strings  |
+ * | `maps`                  | `maps`                | 'array'    | `'array'`, `'auto'` (recommended) or `'object'`: see {@see MapMode} |
  *
  * Non-strict mode accepts trailing bytes (ignored), duplicate map keys (last wins) and
  * invalid UTF-8. It never relaxes bounds, depth or size checks.
@@ -30,6 +31,7 @@ final readonly class DecodeOptions
 
     private const KEYS = [
         'strict', 'max_depth', 'max_decompressed_size', 'auto_decompress', 'hmac_key', 'timestamps', 'binary_as_object',
+        'maps',
     ];
 
     /**
@@ -44,6 +46,7 @@ final readonly class DecodeOptions
         public ?string $hmacKey = null,
         public TimestampMode $timestamps = TimestampMode::DateTime,
         public bool $binaryAsObject = false,
+        public MapMode $maps = MapMode::Array,
     ) {
         // Runtime checks: callers without static analysis can pass anything.
         Options::maxDepth($maxDepth);
@@ -66,6 +69,7 @@ final readonly class DecodeOptions
         $hmacKey = null;
         $timestamps = TimestampMode::DateTime;
         $binaryAsObject = false;
+        $maps = MapMode::Array;
         foreach ($options as $name => $value) {
             switch ($name) {
                 case 'strict':
@@ -89,11 +93,14 @@ final readonly class DecodeOptions
                 case 'binary_as_object':
                     $binaryAsObject = Options::bool($name, $value);
                     break;
+                case 'maps':
+                    $maps = Options::enum($name, $value, MapMode::class);
+                    break;
                 default:
                     throw Options::unknown((string) $name, 'decode', self::KEYS);
             }
         }
 
-        return new self($strict, $maxDepth, $maxSize, $autoDecompress, $hmacKey, $timestamps, $binaryAsObject);
+        return new self($strict, $maxDepth, $maxSize, $autoDecompress, $hmacKey, $timestamps, $binaryAsObject, $maps);
     }
 }

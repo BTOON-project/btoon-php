@@ -6,6 +6,8 @@ namespace BTOON\Tests;
 
 use BTOON\BtoonException;
 use BTOON\Compression;
+use BTOON\DecodeOptions;
+use BTOON\EncodeOptions;
 use BTOON\Internal\ZstdFrame;
 use BTOON\Tests\Support\Vectors;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -312,6 +314,30 @@ final class EnvelopeTest extends TestCase
         $this->assertDecodeError('invalid_envelope', substr_replace($signed, "\x01", 7, 1), ['hmac_key' => self::KEY]);
         // Short "BTSG…" input without a key is just a bare document (66 + trailing bytes).
         $this->assertDecodeError('trailing_data', 'BTSG' . str_repeat("\x00", 10));
+    }
+
+    public function testEmptyHmacKeyIsAnErrorNotNoKey(): void
+    {
+        // SPEC §8: an empty key is a configuration error. "No key" is null.
+        $signed = encode(['a' => 1], ['hmac_key' => self::KEY]);
+        $attempts = [
+            'EncodeOptions' => static fn () => new EncodeOptions(hmacKey: ''),
+            'DecodeOptions' => static fn () => new DecodeOptions(hmacKey: ''),
+            'encode' => static fn () => encode(['a' => 1], ['hmac_key' => '']),
+            'encode, compressed' => static fn () => encode(self::document(), ['compress' => true, 'hmac_key' => '']),
+            'decode of signed input' => static fn () => decode($signed, ['hmac_key' => '']),
+            'decode of unsigned input' => static fn () => decode(encode(['a' => 1]), ['hmac_key' => '']),
+        ];
+        foreach ($attempts as $case => $attempt) {
+            try {
+                $attempt();
+                self::fail("$case: accepted an empty key");
+            } catch (BtoonException $e) {
+                self::assertSame('invalid_argument', $e->errorCode, $case);
+            }
+        }
+        self::assertSame(['a' => 1], decode(encode(['a' => 1], ['hmac_key' => null]), ['hmac_key' => null]));
+        self::assertSame(['a' => 1], decode(encode(['a' => 1]), new DecodeOptions(hmacKey: null)));
     }
 
     // --- helpers ----------------------------------------------------------------------

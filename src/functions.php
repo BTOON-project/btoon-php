@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace BTOON;
 
 /** Version of this library. */
-const VERSION = '0.1.0';
+const VERSION = '0.1.1';
 
 /** Version of the BTOON specification this library implements. */
 const SPEC_VERSION = '0.1';

@@ -6,6 +6,7 @@ namespace BTOON\Tests;
 
 use BTOON\BtoonException;
 use BTOON\DecodeOptions;
+use BTOON\MapMode;
 use BTOON\Tests\Support\TypedValue;
 use BTOON\Tests\Support\Vectors;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -70,13 +71,18 @@ final class ConformanceTest extends TestCase
         $bytes = Vectors::bytes($vector);
         $options = Vectors::options($vector);
 
-        // Lossless mode: Timestamp/Date/DateTime objects and Binary.
-        $precise = decode($bytes, $options + ['timestamps' => 'object', 'binary_as_object' => true]);
-        self::assertNull(TypedValue::diff($vector->value, $precise, true));
+        // Lossless mode: Timestamp/Date/DateTime objects, Binary, and maps that PHP would
+        // turn into lists as ArrayObject.
+        $precise = decode($bytes, $options + ['timestamps' => 'object', 'binary_as_object' => true, 'maps' => 'auto']);
+        self::assertNull(TypedValue::diff($vector->value, $precise, true, MapMode::Auto));
 
-        // Default PHP mapping: DateTimeImmutable and plain strings.
+        // Default PHP mapping: DateTimeImmutable, plain strings and arrays.
         $default = decode($bytes, $options);
         self::assertNull(TypedValue::diff($vector->value, $default, false));
+
+        // Every map as an ArrayObject.
+        $objects = decode($bytes, $options + ['maps' => 'object']);
+        self::assertNull(TypedValue::diff($vector->value, $objects, false, MapMode::Object));
     }
 
     #[DataProvider('canonicalVectors')]

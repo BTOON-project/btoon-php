@@ -11,7 +11,7 @@ namespace BTOON;
 final class BTOON
 {
     /** Version of this library. */
-    public const VERSION = '0.1.0';
+    public const VERSION = '0.1.1';
 
     /** Version of the BTOON specification this library implements. */
     public const SPEC_VERSION = '0.1';

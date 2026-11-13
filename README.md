@@ -17,7 +17,7 @@ bytes, and size-limited decompression.
 
 |                    |                                                                     |
 |--------------------|---------------------------------------------------------------------|
-| Library version    | 0.1.0 (`BTOON\VERSION`)                                             |
+| Library version    | 0.1.1 (`BTOON\VERSION`)                                             |
 | Spec version       | 0.1 (`BTOON\SPEC_VERSION`), [SPEC.md](https://github.com/BTOON-project/btoon-core/blob/main/docs/SPEC.md) |
 | Conformance        | all 260 vectors of `btoon-core/tests/vectors` (the zstd and lz4 vectors need those extensions; brotli is not supported, see [Compression](#compression)) |
 | Requirements       | PHP 8.2+ (64-bit), ext-zlib                                         |
@@ -113,8 +113,8 @@ Deep or cyclic structures raise `max_depth` (default limit 128).
 | string | `string` |
 | binary | `string`, or `BTOON\Binary` with `binary_as_object => true` |
 | array | list array |
-| map | associative array |
-| tabular | list of associative arrays |
+| map | associative array; with `maps => 'auto'`, `ArrayObject` when PHP would turn it into a list (see below) |
+| tabular | list of maps, as above |
 | timestamp (-1) | `DateTimeImmutable` in UTC (or in the timestamp's fixed offset, such as `+02:00`); `BTOON\Timestamp` with `timestamps => 'object'` |
 | date (-2), datetime (-3) | `DateTimeImmutable` in UTC; `BTOON\Date` / `BTOON\DateTime` with `timestamps => 'object'` |
 | float32 / float64 vector | `BTOON\VectorF32` / `BTOON\VectorF64` |
@@ -132,12 +132,20 @@ These follow the cross-language rules of the BTOON implementation guide:
 - **A string that is not valid UTF-8 encodes as binary**, because strict decoders reject
   invalid UTF-8 in strings. Wrap bytes in `BTOON\Binary` to force binary.
 - **Integer-like map keys** such as `"10"` or `"-1"` become `int` array keys on decode,
-  because that is how PHP arrays work. The encoder turns them back into strings, so the
-  round trip is lossless.
-- **Some maps decode to arrays that re-encode differently:** an empty map decodes to
-  `[]`, and a map with keys `"0"…"n-1"` in order decodes to a list. Re-encoding those
-  gives an array. Likewise a binary value that is valid UTF-8 decodes to a string and
-  re-encodes as a string unless you decode with `binary_as_object => true`.
+  because that is how PHP arrays work. The encoder turns them back into strings.
+- **Maps that PHP would turn into a list.** An empty map, or a map whose keys are
+  `"0"…"n-1"` in that order, is a list as a PHP array, and a list encodes as an array. By
+  default such maps decode to arrays, so they re-encode as arrays: `decode("\x80")` is
+  `[]`, and `{"0": 1}` decodes to `[1]`. Decode with `maps => 'auto'` to keep them maps:
+  they become `ArrayObject`, which encodes as a map, while every other map stays an
+  associative array. `'auto'` is recommended, and becomes the default in 0.2.0.
+  `maps => 'object'` returns every map as an `ArrayObject`.
+- **A binary value that is valid UTF-8 decodes to a string**, and re-encodes as a string
+  unless you decode with `binary_as_object => true`.
+
+With `maps => 'auto'`, maps and arrays keep their type through a decode and encode round
+trip. With `binary_as_object => true` and `timestamps => 'object'` as well, encoding what
+strict mode decoded gives back the same value.
 
 ## Big integers
 
@@ -239,6 +247,7 @@ Options are a snake_case array, or the typed `EncodeOptions` / `DecodeOptions` o
 | `hmac_key` | `null` | Require and verify a signed envelope. |
 | `timestamps` | `'datetime'` | `'datetime'` returns `DateTimeImmutable`; `'object'` returns `Timestamp` / `Date` / `DateTime`. |
 | `binary_as_object` | `false` | Return binaries as `BTOON\Binary` instead of strings. |
+| `maps` | `'array'` | `'array'` returns every map as an array, so the maps PHP turns into lists re-encode as arrays; `'auto'` (recommended, the default from 0.2.0) returns those maps as `ArrayObject` and the rest as arrays; `'object'` returns every map as an `ArrayObject` (or a `BTOON\MapMode` case). |
 
 ## Errors
 
@@ -276,8 +285,9 @@ try {
 ## Security notes
 
 - Decoding is bounded by the input: element counts are checked against the remaining
-  bytes before any loop, and nesting stops at `max_depth`. Keep `max_depth` modest; the
-  decoder is recursive.
+  bytes before any loop, containers grow as their elements are decoded (a table creates
+  each row with its first cell), and nesting stops at `max_depth`. Keep `max_depth`
+  modest; the decoder is recursive.
 - Strict mode, the default, rejects duplicate keys and invalid UTF-8 so that two
   conforming decoders can't disagree about what a document means.
 - Verify signatures on the bytes you received (that's what `hmac_key` does); don't
