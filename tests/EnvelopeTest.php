@@ -81,6 +81,10 @@ final class EnvelopeTest extends TestCase
             'gzip, not zlib' => self::envelope(0, gzencode($plain), \strlen($plain)),
             'empty payload' => self::envelope(0, '', \strlen($plain)),
             'preset dictionary' => self::envelope(0, self::zlibWithDictionary($plain), \strlen($plain)),
+            // FDICT set with DICTID 1, the Adler-32 of an empty dictionary, which Go's
+            // compress/zlib accepted: FDICT is invalid_envelope whatever the DICTID (SPEC §6).
+            'FDICT with the empty dictionary\'s id' => self::envelope(0, "\x78\x20\x00\x00\x00\x01" . substr(gzcompress('hello'), 2), 5),
+            'FDICT with another FLEVEL' => self::envelope(0, "\x78\xbb\x00\x00\x00\x01" . substr(gzcompress('hello'), 2), 5),
             'compressed_size mismatch' => self::envelope(0, $z, \strlen($plain), compressed: \strlen($z) - 1),
             'version 0' => self::envelope(0, $z, \strlen($plain), version: 0),
             'reserved bits' => self::envelope(0, $z, \strlen($plain), reserved: 0x8000),
@@ -124,6 +128,12 @@ final class EnvelopeTest extends TestCase
         self::assertSame(decode($plain), decode($packed, ['max_decompressed_size' => \strlen($plain)]));
         $this->assertDecodeError('size_limit', $packed, ['max_decompressed_size' => \strlen($plain) - 1]);
         $this->assertDecodeError('size_limit', $packed, ['max_decompressed_size' => 0]);
+        // The default is 64 MiB (SPEC §7.1; 256 MiB before 0.2), checked before inflating.
+        // Under phpunit.xml.dist's memory_limit of 1G it isn't lowered (LimitsTest).
+        $z = gzcompress($plain);
+        self::assertSame(64 << 20, (new DecodeOptions())->maxDecompressedSize);
+        $this->assertDecodeError('size_limit', self::envelope(0, $z, (64 << 20) + 1));
+        $this->assertDecodeError('invalid_envelope', self::envelope(0, $z, 64 << 20));
     }
 
     public function testEnvelopeDetectionRules(): void

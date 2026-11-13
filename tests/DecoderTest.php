@@ -123,10 +123,14 @@ final class DecoderTest extends TestCase
         $lax = ['strict' => false];
         self::assertSame(1, decode(hex2bin('0102'), $lax)); // trailing bytes ignored
         self::assertSame(['a' => 2], decode(hex2bin('82a16101a16102'), $lax)); // last wins
-        self::assertSame("\xff", decode(hex2bin('a1ff'), $lax)); // no UTF-8 check
-        self::assertSame(["\xff" => 1], decode(hex2bin('81a1ff01'), $lax));
-        $table = hex2bin('c718f600000001000000010000000200000001ff02000000020102');
-        self::assertSame([["\xff" => 1], ["\xff" => 2]], decode($table, $lax));
+        self::assertSame("\xff", decode(hex2bin('a1ff'), $lax)); // string values: no UTF-8 check
+        self::assertSame(['a' => "\xff"], decode(hex2bin('81a161a1ff'), $lax));
+
+        // Map keys and column names must be UTF-8 in both modes (SPEC §7): keys compare by
+        // their bytes, and replacing invalid sequences could merge two keys.
+        foreach (['81a1ff01', '82a1ff01a1fe02', 'c718f600000001000000010000000200000001ff02000000020102'] as $hex) {
+            $this->assertDecodeError('invalid_utf8', (string) hex2bin($hex), $lax);
+        }
 
         // Bounds, depth, keys, tabular structure and extensions stay strict.
         foreach (['a561' => 'truncated', '9201' => 'truncated', 'c1' => 'invalid_marker', '810101' => 'non_string_key',
@@ -146,6 +150,12 @@ final class DecoderTest extends TestCase
         $this->assertDecodeError('max_depth', (string) hex2bin('919191c0'), ['max_depth' => 2]);
         self::assertSame(1, decode("\x01", ['max_depth' => 0]));
         $this->assertDecodeError('max_depth', "\x90", ['max_depth' => 0]);
+        // At most 1000 (SPEC §7): deeper limits could exhaust the stack.
+        $deep = str_repeat("\x91", 1000) . "\xc0";
+        self::assertSame(bin2hex($deep), bin2hex(encode(decode($deep, ['max_depth' => 1000]), ['max_depth' => 1000])));
+        $this->assertDecodeError('max_depth', $deep, ['max_depth' => 999]);
+        $this->assertDecodeError('invalid_argument', "\xc0", ['max_depth' => 1001]);
+        self::assertSame(1000, DecodeOptions::MAX_DEPTH_LIMIT);
         // A tabular array is two levels: array and row maps.
         $table = encode(array_fill(0, 10, ['a' => 1]));
         self::assertCount(10, decode($table, ['max_depth' => 2]));
@@ -171,10 +181,16 @@ final class DecoderTest extends TestCase
 
             return;
         }
+        if ($marker === 0x80) {
+            // The empty map: an ArrayObject with the default maps => 'auto'.
+            self::assertEquals(new \ArrayObject([]), $value);
+
+            return;
+        }
         $expected = match (true) {
             $marker <= 0x7f => $marker,
             $marker >= 0xe0 => $marker - 256,
-            $marker === 0x80, $marker === 0x90 => [],
+            $marker === 0x90 => [],
             $marker === 0xa0 => '',
             $marker === 0xc0 => null,
             $marker === 0xc2 => false,
@@ -197,15 +213,18 @@ final class DecoderTest extends TestCase
     }
 
     /**
-     * With maps => 'auto', a map whose keys PHP would turn into a list (none, or "0"…"n-1"
-     * in order) decodes to an ArrayObject, which encodes as a map. By default these maps
-     * decode to PHP lists, so a round trip turns them into arrays (review 2026-11-13).
+     * With maps => 'auto', the default since 0.2.0, a map whose keys PHP would turn into a
+     * list (none, or "0"…"n-1" in order) decodes to an ArrayObject, which encodes as a map.
+     * With maps => 'array', the 0.1.x default, these maps decode to PHP lists, so a round
+     * trip turns them into arrays (review 2026-11-13).
      */
     #[DataProvider('mapsPhpWouldTurnIntoLists')]
     public function testMapsThatPhpWouldTurnIntoListsSurviveARoundTrip(string $hex): void
     {
+        self::assertSame($hex, bin2hex(encode(decode(hex2bin($hex)))));
         self::assertSame($hex, bin2hex(encode(decode(hex2bin($hex), ['maps' => 'auto']))));
         self::assertSame($hex, bin2hex(encode(decode(hex2bin($hex), ['maps' => 'object']))));
+        self::assertNotSame($hex, bin2hex(encode(decode(hex2bin($hex), ['maps' => 'array']))));
     }
 
     public function testOnlyMapsThatPhpWouldTurnIntoListsBecomeArrayObject(): void
@@ -256,27 +275,43 @@ final class DecoderTest extends TestCase
         $this->assertDecodeError('invalid_argument', "\x01", ['maps' => true]);
     }
 
-    /** 0.1.x keeps the 0.1.0 mapping by default: 'auto' becomes the default in 0.2.0. */
-    public function testDefaultMapModeIsStillArray(): void
+    /**
+     * 'auto' is the default since 0.2.0, so default round trips are lossless: the maps that
+     * PHP would turn into lists decode to ArrayObject. 'array' keeps the 0.1.x mapping.
+     */
+    public function testDefaultMapModeIsAuto(): void
     {
-        self::assertSame(MapMode::Array, (new DecodeOptions())->maps);
-        self::assertSame(MapMode::Array, DecodeOptions::fromArray([])->maps);
-        self::assertSame(MapMode::Array, (new Decoder())->getOptions()->maps);
-        self::assertSame([], decode(hex2bin('80')));
-        self::assertSame([1], decode(hex2bin('81a13001')));
+        self::assertSame(MapMode::Auto, (new DecodeOptions())->maps);
+        self::assertSame(MapMode::Auto, DecodeOptions::fromArray([])->maps);
+        self::assertSame(MapMode::Auto, (new Decoder())->getOptions()->maps);
+        $empty = decode(hex2bin('80'));
+        self::assertInstanceOf(\ArrayObject::class, $empty);
+        self::assertSame([], $empty->getArrayCopy());
+        $zero = decode(hex2bin('81a13001'));
+        self::assertInstanceOf(\ArrayObject::class, $zero);
+        self::assertSame([0 => 1], $zero->getArrayCopy());
         self::assertSame(['a' => 1], decode(hex2bin('81a16101')));
+        self::assertSame([], decode(hex2bin('90')));
         $rows = decode(encode(array_map(static fn (int $i) => new \ArrayObject([$i]), range(0, 9))));
-        self::assertSame(array_map(static fn (int $i) => [$i], range(0, 9)), $rows);
-        // So these maps still re-encode as arrays unless 'auto' is asked for.
-        self::assertSame('90', bin2hex(encode(decode(hex2bin('80')))));
-        self::assertSame('9101', bin2hex(encode(decode(hex2bin('81a13001')))));
+        self::assertIsArray($rows);
+        self::assertContainsOnlyInstancesOf(\ArrayObject::class, $rows);
+        // Maps and arrays keep their type through a default round trip.
+        foreach (['80', '90', '929080', '81a13001', '81a16180', '82a13001a13102'] as $hex) {
+            self::assertSame($hex, bin2hex(encode(decode(hex2bin($hex)))));
+        }
+        // 'array' is still available: these maps come back as lists and re-encode as arrays.
+        self::assertSame([], decode(hex2bin('80'), ['maps' => 'array']));
+        self::assertSame([1], decode(hex2bin('81a13001'), ['maps' => 'array']));
+        self::assertSame('90', bin2hex(encode(decode(hex2bin('80'), ['maps' => 'array']))));
+        self::assertSame('9101', bin2hex(encode(decode(hex2bin('81a13001'), ['maps' => 'array']))));
     }
 
     /**
      * Nested tables used to build every row they announced before decoding a cell, and
      * each level was checked against the same remaining bytes: 64 levels in 1 MiB built
      * 2 GB of empty rows (review 2026-11-13, X1). Rows are now created as their first cell
-     * is decoded.
+     * is decoded. Each level also announces 131,076 rows, which max_values now stops after
+     * a few levels (SPEC §7.1); without it, the table still fails within bounded memory.
      */
     public function testNestedTablesDoNotPreallocateRows(): void
     {
@@ -291,11 +326,13 @@ final class DecoderTest extends TestCase
         for ($level = 1; $level < 64; ++$level) {
             $doc = $table($doc, \strlen($doc) + 4);
         }
-        $base = memory_get_usage();
-        memory_reset_peak_usage();
-        $this->assertDecodeError('invalid_tabular', $doc);
-        $peak = memory_get_peak_usage() - $base;
-        self::assertLessThan(8 * 1024 * 1024, $peak, sprintf('a %d-byte document took %d bytes', \strlen($doc), $peak));
+        foreach (['size_limit' => [], 'invalid_tabular' => ['max_values' => PHP_INT_MAX]] as $code => $options) {
+            $base = memory_get_usage();
+            memory_reset_peak_usage();
+            $this->assertDecodeError($code, $doc, $options);
+            $peak = memory_get_peak_usage() - $base;
+            self::assertLessThan(8 * 1024 * 1024, $peak, sprintf('a %d-byte document took %d bytes', \strlen($doc), $peak));
+        }
     }
 
     public function testErrorsReportTheirByteOffset(): void
@@ -329,6 +366,10 @@ final class DecoderTest extends TestCase
         yield 'encode-only key' => [['compress' => true]];
         yield 'strict not bool' => [['strict' => 0]];
         yield 'negative size' => [['max_decompressed_size' => -1]];
+        yield 'size not int' => [['max_decompressed_size' => '1M']];
+        yield 'negative max_values' => [['max_values' => -1]];
+        yield 'max_values not int' => [['max_values' => 1.5]];
+        yield 'depth above 1000' => [['max_depth' => 1001]];
         yield 'bad timestamps mode' => [['timestamps' => 'carbon']];
         yield 'empty hmac key' => [['hmac_key' => '']];
     }
