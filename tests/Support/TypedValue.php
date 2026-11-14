@@ -38,8 +38,8 @@ final class TypedValue
             'array' => array_map(self::build(...), self::typedList($value)),
             'map' => self::map(self::object($value)),
             'timestamp' => self::timestamp(self::object($value)),
-            'date' => new Date((int) self::str($value)),
-            'datetime' => new DateTime((int) self::str($value)),
+            'date' => new Date(self::int64(self::str($value))),
+            'datetime' => new DateTime(self::int64(self::str($value))),
             'float32_vector' => VectorF32::fromBytes(self::vectorBytes(self::stringList($value), 4)),
             'float64_vector' => VectorF64::fromBytes(self::vectorBytes(self::stringList($value), 8)),
             'ext' => new Ext(self::intField(self::object($value), 'type'), self::hex(self::object($value)->data ?? '')),
@@ -156,21 +156,19 @@ final class TypedValue
                 return self::sameInstant($actual, $ts->seconds, intdiv($ts->nanoseconds, 1000), $ts->offsetMinutes)
                     ? null : $fail(sprintf('expected DateTimeImmutable for %d.%09d', $ts->seconds, $ts->nanoseconds));
             case 'date':
-                $ms = (int) self::str($expected);
+                $ms = self::int64(self::str($expected));
                 if ($objects) {
                     return $actual instanceof Date && $actual->milliseconds === $ms ? null : $fail("expected Date($ms)");
                 }
-                $seconds = intdiv($ms, 1000) - ($ms % 1000 < 0 ? 1 : 0);
-                $rest = $ms - $seconds * 1000;
+                [$seconds, $rest] = self::floorDivMod($ms, 1000);
 
                 return self::sameInstant($actual, $seconds, $rest * 1000, null) ? null : $fail("expected DateTimeImmutable for $ms ms");
             case 'datetime':
-                $ns = (int) self::str($expected);
+                $ns = self::int64(self::str($expected));
                 if ($objects) {
                     return $actual instanceof DateTime && $actual->nanoseconds === $ns ? null : $fail("expected DateTime($ns)");
                 }
-                $seconds = intdiv($ns, 1_000_000_000) - ($ns % 1_000_000_000 < 0 ? 1 : 0);
-                $rest = $ns - $seconds * 1_000_000_000;
+                [$seconds, $rest] = self::floorDivMod($ns, 1_000_000_000);
 
                 return self::sameInstant($actual, $seconds, intdiv($rest, 1000), null) ? null : $fail("expected DateTimeImmutable for $ns ns");
             case 'float32_vector':
@@ -226,6 +224,38 @@ final class TypedValue
         $value = new BigInt($decimal);
 
         return $value->fitsInt() ? $value->toInt() : $value;
+    }
+
+    /**
+     * A decimal count of a date or datetime, which must fit in 64 bits. An `(int)` cast
+     * would saturate instead of failing.
+     */
+    private static function int64(string $decimal): int
+    {
+        $value = filter_var($decimal, FILTER_VALIDATE_INT);
+        if (!\is_int($value)) {
+            throw new \UnexpectedValueException("not a 64-bit integer: $decimal");
+        }
+
+        return $value;
+    }
+
+    /**
+     * Floor division without overflow, also at PHP_INT_MIN: [quotient, remainder] with
+     * 0 <= remainder < $divisor.
+     *
+     * @return array{int, int}
+     */
+    private static function floorDivMod(int $value, int $divisor): array
+    {
+        $quotient = intdiv($value, $divisor);
+        $remainder = $value % $divisor;
+        if ($remainder < 0) {
+            $remainder += $divisor;
+            --$quotient;
+        }
+
+        return [$quotient, $remainder];
     }
 
     /**

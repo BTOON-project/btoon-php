@@ -11,10 +11,10 @@ namespace BTOON;
 final class BTOON
 {
     /** Version of this library. */
-    public const VERSION = '0.2.0';
+    public const VERSION = '0.3.0';
 
     /** Version of the BTOON specification this library implements. */
-    public const SPEC_VERSION = '0.2';
+    public const SPEC_VERSION = '0.3';
 
     private function __construct()
     {

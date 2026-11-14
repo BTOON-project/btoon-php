@@ -76,22 +76,30 @@ final class Clock
     }
 
     /**
-     * `$seconds * $unit + $fraction` with an overflow check (0 <= $fraction < $unit).
+     * `$seconds * $unit + $fraction` with an overflow check (0 <= $fraction < $unit). Every
+     * result in the 64-bit range is accepted, PHP_INT_MIN included.
      *
      * @param positive-int $unit
      */
     public static function combine(int $seconds, int $fraction, int $unit, string $what): int
     {
-        $ok = $seconds >= 0
-            ? $seconds <= intdiv(PHP_INT_MAX - $fraction, $unit)
-            : $seconds >= intdiv(PHP_INT_MIN, $unit);
-        if (!$ok) {
-            throw new BtoonException(
-                ErrorCode::InvalidArgument,
-                sprintf('instant is outside the range of a BTOON %s (64-bit count since 1970)', $what),
-            );
+        if ($seconds >= 0) {
+            if ($seconds <= intdiv(PHP_INT_MAX - $fraction, $unit)) {
+                return $seconds * $unit + $fraction;
+            }
+        } else {
+            // The earliest count is floor(PHP_INT_MIN / unit) seconds plus a fraction, so that
+            // second is in range only from that fraction on. (seconds + 1) × unit can't
+            // overflow, and taking (unit - fraction) away from it then stays in range.
+            [$minSeconds, $minFraction] = self::floorDivMod(PHP_INT_MIN, $unit);
+            if ($seconds > $minSeconds || ($seconds === $minSeconds && $fraction >= $minFraction)) {
+                return ($seconds + 1) * $unit - ($unit - $fraction);
+            }
         }
 
-        return $seconds * $unit + $fraction;
+        throw new BtoonException(
+            ErrorCode::InvalidArgument,
+            sprintf('instant is outside the range of a BTOON %s (64-bit count since 1970)', $what),
+        );
     }
 }

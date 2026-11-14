@@ -1,0 +1,10 @@
+# Composer installs the dist archive that GitHub builds with `git archive`. Keep it to the
+# library and its documentation: these are for development only (tests/PackageTest.php).
+/.github            export-ignore
+/bench              export-ignore
+/stubs              export-ignore
+/tests              export-ignore
+/.gitattributes     export-ignore
+/.gitignore         export-ignore
+/phpstan.neon.dist  export-ignore
+/phpunit.xml.dist   export-ignore

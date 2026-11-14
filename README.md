@@ -13,14 +13,14 @@ compact binary serialization format. BTOON is MessagePack plus:
 Encoding is **canonical**: every value has exactly one encoding, so every BTOON
 implementation produces the same bytes for the same value. Decoding is **hardened**
 against hostile input: bounds-checked reads, a nesting limit, strict UTF-8, no trailing
-bytes, size-limited decompression, and a bound on how many values a document decodes to
-(see [Limits](#limits)).
+bytes, size-limited decompression, and bounds on how many values a document decodes to and
+how large a map may be (see [Limits](#limits)).
 
 |                    |                                                                     |
 |--------------------|---------------------------------------------------------------------|
-| Library version    | 0.2.0 (`BTOON\VERSION`)                                             |
-| Spec version       | 0.2 (`BTOON\SPEC_VERSION`), [SPEC.md](https://github.com/BTOON-project/btoon-core/blob/main/docs/SPEC.md) |
-| Conformance        | all 298 vectors of `btoon-core/tests/vectors` (the zstd and lz4 vectors need those extensions; brotli is not supported, see [Compression](#compression)) |
+| Library version    | 0.3.0 (`BTOON\VERSION`)                                             |
+| Spec version       | 0.3 (`BTOON\SPEC_VERSION`), [SPEC.md](https://github.com/BTOON-project/btoon-core/blob/main/docs/SPEC.md) |
+| Conformance        | all 311 vectors of `btoon-core/tests/vectors` (the zstd and lz4 vectors need those extensions; brotli is not supported, see [Compression](#compression)) |
 | Requirements       | PHP 8.2+ (64-bit), ext-zlib                                         |
 | Optional           | ext-mbstring (faster UTF-8 checks), ext-gmp (faster big integers), ext-zstd, ext-lz4, ext-snappy |
 
@@ -164,7 +164,9 @@ $n->toGmp();          // needs ext-gmp
 
 With ext-gmp, conversions use GMP; without it, a pure-PHP fallback is used. Decoding a
 huge bigint is linear in its size, because the decimal string is computed only when you
-ask for it.
+ask for it. `toInt()` raises `invalid_argument` for a value outside PHP's int range, and
+describes one longer than 128 bits by its size ("an integer of 799999 bits") rather than
+spelling it out.
 
 ## Timestamps
 
@@ -179,6 +181,11 @@ encode($local);                                         // UTC instant, no offse
 encode(Timestamp::fromDateTime($local, keepOffset: true)); // offset +120 minutes kept
 encode(new Timestamp(1704067200, 500_000_000));         // nanosecond precision
 ```
+
+`BTOON\Date` (milliseconds) and `BTOON\DateTime` (nanoseconds) write the date (-2) and
+datetime (-3) types, over their whole 64-bit range. Decode with `timestamps => 'object'` to
+get `Timestamp`, `Date` and `DateTime` back, so that all three round-trip exactly
+(SPEC §10); the default `DateTimeImmutable` holds microseconds.
 
 ## Compression
 
@@ -209,7 +216,12 @@ decompressed, output is cut
 off as soon as it exceeds the declared size, and payloads with trailing bytes, a wrong
 size, a bad checksum or a preset dictionary are rejected with `invalid_envelope`. Zstd
 frames are validated before decompression (a single frame, a matching content size, and a
-window no larger than max(8 MiB, min(size, 128 MiB))).
+window no larger than max(8 MiB, min(size, 128 MiB))). An LZ4 block must be valid under the
+block format, end-of-block conditions included, and no match offset may be 0 or reach back
+before the start of the output (SPEC §6). liblz4, which ext-lz4 uses, skips some of these
+checks on its fast path, so the library checks the block's structure in PHP before ext-lz4
+decodes it. With PHP 8.5 that costs about 50 ns per LZ4 sequence: 0.2 s for the 4 million
+sequences that 16 MiB of output can hold, and a quarter to a third of a typical decode.
 
 ## Signing
 
@@ -246,6 +258,7 @@ Options are a snake_case array, or the typed `EncodeOptions` / `DecodeOptions` o
 | `max_depth` | `128` | Nesting limit. A tabular array counts as two levels. At most 1000; more raises `invalid_argument`. |
 | `max_decompressed_size` | 64 MiB, lower under a small `memory_limit` | Largest accepted `uncompressed_size` of a compression envelope, in bytes, and the most column-name bytes a table may copy into its rows. See [Limits](#limits). |
 | `max_values` | 2^20 (1,048,576), lower under a small `memory_limit` | Most values a document may decode to. See [Limits](#limits). |
+| `max_map_entries` | `4096` | Most entries in one map, and columns in one table. See [Map size](#map-size). |
 | `auto_decompress` | `true` | Accept compression envelopes; when false they raise `invalid_envelope`. |
 | `hmac_key` | `null` | Require and verify a signed envelope. An empty string raises `invalid_argument`. |
 | `timestamps` | `'datetime'` | `'datetime'` returns `DateTimeImmutable`; `'object'` returns `Timestamp` / `Date` / `DateTime`. |
@@ -293,6 +306,41 @@ less; 0.1.x ran out of memory on the first three. The defaults depend only on th
 are used as given: to decode large tables, raise `max_values` (and `memory_limit`). For
 untrusted input, keep the defaults or lower them.
 
+#### Map size
+
+PHP's own limit, `max_map_entries`, bounds how many entries one map may have, and how many
+columns one table may have (its rows are maps). It defaults to 4096. A larger map raises
+`size_limit`, with a message that names the option. PHP hashes array keys with a fixed
+function and no secret seed, so keys can be chosen to share one hash ("Ez" and "FY" do, and
+so does every string of such pairs), and then every key added to a map is compared with all
+the keys already in it: a single map of 65,536 such keys took 9 s to decode, and one of
+2^20 keys, within the value limit, would take over half an hour. With at most 4,096 entries
+per map, the cost stays linear in `max_values`. Decoding times with PHP 8.5.12 on an Apple
+M4 Max:
+
+| A document of | 131,072 values (`memory_limit=128M`) | 2^20 values (`memory_limit` of 1G or more) |
+|---|---:|---:|
+| maps of 4,096 keys that share one hash | 0.6 s | 4.8 s |
+| one-row tables of 4,096 columns whose names share one hash | 0.6 s | 4.7 s |
+| maps of 4,096 ordinary keys | 0.03 s | 0.24 s |
+| timestamps, the slowest ordinary values | 0.05 s | 0.44 s |
+
+The cap is a trade-off. A lower one bounds the worst case further (with 1,024, the first
+row takes 0.17 s and 1.3 s), but rejects ordinary documents that every other BTOON library
+decodes, such as a few thousand entries keyed by id; other runtimes randomize their hash
+functions, so they need no such limit. To decode larger maps, raise it:
+
+```php
+decode($bytes, ['max_map_entries' => 100_000]);
+new Decoder(new DecodeOptions(maxMapEntries: 100_000));
+```
+
+For untrusted input under a `memory_limit` of 1G or more, where `max_values` is 2^20,
+consider lowering it to 1,024. A table pays for its names once, not once per row: a table
+wider than 16 columns builds its rows as copies of one template row, and a table without
+rows compares keyed digests of its names. PHP's own guard against the same attack,
+`max_input_vars`, defaults to 1000.
+
 ## Errors
 
 Every failure is a `BTOON\BtoonException` carrying a SPEC §7 error code, shared by all
@@ -321,7 +369,7 @@ try {
 | `invalid_extension` | A malformed timestamp, date, datetime, bigint or vector payload. |
 | `invalid_tabular` | A malformed tabular payload. |
 | `invalid_envelope` | A malformed compression or signed envelope, or a corrupt compressed payload. |
-| `size_limit` | A document over `max_values`, a declared size above `max_decompressed_size`, a table whose rows × column-name bytes exceed it, or data too large for the format (over 4 GiB). |
+| `size_limit` | A document over `max_values`, a declared size above `max_decompressed_size`, a table whose rows × column-name bytes exceed it, a map with more entries or a table with more columns than `max_map_entries`, or data too large for the format (over 4 GiB). |
 | `unsupported_compression` | An unknown or unavailable compression algorithm. |
 | `authentication_failed` | Missing or wrong signature, or a signature without a key. |
 | `invalid_argument` | A value that can't be encoded (including a `BTOON\Ext` with an id BTOON defines, -1…-6 or -10), or an invalid option. |
@@ -330,9 +378,11 @@ try {
 
 - Decoding is bounded by the input and by the [limits](#limits): element counts are
   checked against the remaining bytes before any loop, containers grow as their elements
-  are decoded (a table creates each row with its first cell), a document decodes to at
+  are decoded (a table builds its rows from the cells it has decoded), a document decodes to at
   most `max_values` values, and nesting stops at `max_depth` (at most 1000). Keep
   `max_depth` modest; the decoder is recursive.
+- Map keys that share a PHP hash can't make decoding quadratic: maps hold at most
+  `max_map_entries` entries, and wide tables hash their column names once per table.
 - Strict mode, the default, rejects duplicate keys and invalid UTF-8 so that two
   conforming decoders can't disagree about what a document means.
 - Verify signatures on the bytes you received (that's what `hmac_key` does); don't

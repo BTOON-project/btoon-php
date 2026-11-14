@@ -110,6 +110,45 @@ final class BigIntTest extends TestCase
         $big->toInt();
     }
 
+    /**
+     * toInt() describes a value that doesn't fit by its size once it is longer than 128 bits.
+     * The message used to hold the whole decimal value: formatting a 100 KB bigint, which a
+     * 100 KB document carries, took 15.6 s without ext-gmp (review 2026-11-13).
+     */
+    public function testToIntDescribesLargeValuesBySize(): void
+    {
+        $cases = [
+            '2^64, decoded' => [BigInt::fromBytes("\x01" . str_repeat("\x00", 8)), '18446744073709551616 does not fit in a 64-bit PHP int'],
+            '-2^127, decoded' => [BigInt::fromBytes("\x80" . str_repeat("\x00", 15)), '-170141183460469231731687303715884105728 does not fit in a 64-bit PHP int'],
+            '100 KB, decoded' => [BigInt::fromBytes("\x7f" . str_repeat("\xab", 99_999)), 'an integer of 799999 bits does not fit in a 64-bit PHP int'],
+            '-2^799999, decoded' => [BigInt::fromBytes("\x80" . str_repeat("\x00", 99_999)), 'an integer of 800000 bits does not fit in a 64-bit PHP int'],
+            '39 digits' => [new BigInt('-' . str_repeat('9', 39)), '-' . str_repeat('9', 39) . ' does not fit in a 64-bit PHP int'],
+            '2^63, 19 digits' => [new BigInt('9223372036854775808'), '9223372036854775808 does not fit in a 64-bit PHP int'],
+            '100,001 digits' => [new BigInt('1' . str_repeat('0', 100_000)), 'an integer of 100001 digits does not fit in a 64-bit PHP int'],
+        ];
+        foreach ($cases as $case => [$value, $message]) {
+            self::assertFalse($value->fitsInt(), $case);
+            try {
+                $value->toInt();
+                self::fail("$case: toInt() returned");
+            } catch (BtoonException $e) {
+                self::assertSame('invalid_argument', $e->errorCode, $case);
+                self::assertSame($message, $e->getMessage(), $case);
+            }
+        }
+        self::assertSame(PHP_INT_MIN, (new BigInt((string) PHP_INT_MIN))->toInt());
+        self::assertSame(PHP_INT_MAX, BigInt::fromBytes("\x00\x7f" . str_repeat("\xff", 7))->toInt());
+        self::assertTrue((new BigInt('-0000000000000000000000001'))->fitsInt());
+    }
+
+    public function testBitLength(): void
+    {
+        foreach (['00' => 0, '01' => 1, 'ff' => 1, '7f' => 7, '0080' => 8, '80' => 8, 'ff7f' => 8, '00ff' => 8,
+            '0100' => 9, '010000000000000000' => 65, '8000000000000000' => 64, '000000' => 0, 'ffff80' => 8] as $hex => $bits) {
+            self::assertSame($bits, BigIntMath::bitLength((string) hex2bin((string) $hex)), (string) $hex);
+        }
+    }
+
     #[RequiresPhpExtension('gmp')]
     public function testGmpInterop(): void
     {

@@ -86,21 +86,27 @@ final class BigInt implements \Stringable
     /** Whether the value fits in a PHP int (signed 64-bit). */
     public function fitsInt(): bool
     {
-        return \strlen($this->toBytes()) <= 8;
+        return !$this->hasTooManyDigits() && \strlen($this->toBytes()) <= 8;
     }
 
-    /** The value as a PHP int; throws `invalid_argument` if it doesn't fit. */
+    /**
+     * The value as a PHP int; throws `invalid_argument` if it doesn't fit. The error describes
+     * a large value by its size: formatting it in decimal takes time quadratic in its length
+     * without ext-gmp (15.6 s for a 100 KB bigint, which 100 KB of input can carry).
+     */
     public function toInt(): int
     {
-        $bytes = $this->toBytes();
-        if (\strlen($bytes) > 8) {
-            throw new BtoonException(
-                ErrorCode::InvalidArgument,
-                sprintf('%s does not fit in a 64-bit PHP int', $this->toString()),
-            );
+        if (!$this->hasTooManyDigits()) {
+            $bytes = $this->toBytes();
+            if (\strlen($bytes) <= 8) {
+                return BigIntMath::bytesToInt($bytes);
+            }
         }
 
-        return BigIntMath::bytesToInt($bytes);
+        throw new BtoonException(
+            ErrorCode::InvalidArgument,
+            sprintf('%s does not fit in a 64-bit PHP int', $this->describe()),
+        );
     }
 
     public function isNegative(): bool
@@ -120,6 +126,31 @@ final class BigInt implements \Stringable
         }
 
         return $this->toBytes() === $other->toBytes();
+    }
+
+    /**
+     * Whether the value was given in decimal with more digits than any PHP int has (19), so
+     * that it doesn't fit without converting it, which takes quadratic time without ext-gmp.
+     */
+    private function hasTooManyDigits(): bool
+    {
+        return $this->bytes === null && \strlen(ltrim((string) $this->decimal, '-')) > 19;
+    }
+
+    /**
+     * The value in decimal when that is short, otherwise its size, for error messages.
+     * Values up to 128 bits (39 digits) are cheap to convert either way.
+     */
+    private function describe(): string
+    {
+        if ($this->decimal !== null) {
+            $digits = \strlen(ltrim($this->decimal, '-'));
+
+            return $digits <= 39 ? $this->decimal : sprintf('an integer of %d digits', $digits);
+        }
+        $bytes = (string) $this->bytes;
+
+        return \strlen($bytes) <= 16 ? $this->toString() : sprintf('an integer of %d bits', BigIntMath::bitLength($bytes));
     }
 
     private static function normalize(string $value): string

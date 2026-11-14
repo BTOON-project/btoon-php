@@ -1,5 +1,70 @@
 # Changelog
 
+## 0.3.0 (2026-11-14)
+
+Implements BTOON spec 0.3 (`BTOON\SPEC_VERSION` is now `'0.3'`). The wire format and SPEC's
+limits are unchanged. Spec 0.3 tightens what an LZ4 block may be (§6), which liblz4 doesn't
+fully check, so LZ4 envelopes are now checked in PHP first. It also requires timestamp, date
+and datetime values to be writable, with a decoding mode that keeps them exact, which
+already held here. This release also fixes the remaining findings of the 2026-11-13 review.
+The behavior changes are the new `max_map_entries` limit, the stricter LZ4 check and the
+`BigInt::toInt()` error message.
+
+- **Changed: a map may have at most `max_map_entries` entries, 4096 by default**
+  (`DecodeOptions::$maxMapEntries`, `DEFAULT_MAX_MAP_ENTRIES`), and a table at most that
+  many columns. More raises `size_limit`, once the announced count has been checked against
+  the input, with a message that names the option. This is PHP's own limit, not SPEC's. PHP
+  hashes array keys without a secret seed, so keys can be chosen to share one hash, and then
+  each key added to a map is compared with every key before it: one map of 65,536 such keys
+  took 9 s to decode, and one of 2^20 keys, within SPEC's value limit, would take over half
+  an hour. With the limit, a document whose keys all collide decodes in 0.6 s under
+  `memory_limit=128M` (131,072 values; ordinary keys take 0.03 s), and in 4.8 s at 2^20
+  values, which apply from a `memory_limit` of 1G (ordinary keys: 0.24 s; 2^20 timestamps:
+  0.44 s). The cap is a trade-off: 1,024 would bound that to 1.3 s, but would reject
+  ordinary documents that every other BTOON library decodes, such as a few thousand entries
+  keyed by id. To decode larger maps, such as the 65,536-entry map of the reference cases,
+  raise it (`'max_map_entries' => 100_000`); for untrusted input with a high `memory_limit`,
+  consider 1,024.
+- **Fixed (denial of service):** tables no longer hash their column names once per cell. A
+  table wider than 16 columns builds its rows as copies of a template row: 1,024 colliding
+  names × 1,023 rows took 1.2 s, now 0.08 s, as long as ordinary names take (4,096 × 255:
+  4.2 s, now 0.1 s). A table without rows, which counts as one value, compares keyed digests
+  of its names: 61 MB of empty tables with 1,024 colliding names took 4.6 s, now 0.7 s.
+- **Fixed (denial of service):** the decoder and the encoder each cache at most 64 map keys,
+  down from 4,096. The caches are PHP arrays, so with colliding keys each lookup compared up
+  to 4,096 keys: 524,287 one-entry maps took 7.0 s to decode, now 0.26 s, and re-encoding
+  1,023 decoded maps of 1,024 colliding keys took 6.8 s, now 0.4 s.
+- **Changed: `BigInt::toInt()` describes a value longer than 128 bits by its size** ("an
+  integer of 799999 bits does not fit in a 64-bit PHP int") instead of spelling it out in
+  decimal, which took 15.6 s for a 100 KB bigint without ext-gmp. `toInt()` and `fitsInt()`
+  no longer convert a value given as a decimal string of more than 19 digits.
+- **Fixed:** `Date::fromDateTime()` and `DateTime::fromDateTime()` accept every instant in
+  their 64-bit range. They refused the earliest second of it, so the earliest date, decoded
+  to a `DateTimeImmutable`, couldn't become a `Date` again.
+- **Changed: LZ4 blocks are checked against SPEC §6 before ext-lz4 decodes them.** A block
+  must be valid under the LZ4 block format, end-of-block conditions included: its last
+  sequence holds only literals, its last 5 bytes of output are literals, and its last match
+  starts at least 12 bytes before the end. No match offset may be 0 or reach back before the
+  start of the output. Anything else is `invalid_envelope`. liblz4, which ext-lz4 uses,
+  skips the end-of-block and offset-0 checks on its fast path, so 0.2.0 accepted the vectors
+  lz4-block/long-output-ends-with-match and lz4-block/offset-zero. The check is one pass over
+  the block's sequences in PHP, without copying: 0.2 s for the 4 million sequences that
+  16 MiB of output can hold. A block that is a single token without literals now decodes to
+  an empty document whatever its match bits, as SPEC §6 says they are ignored; only `00` did.
+- **Unchanged, now covered by the vectors:** `Timestamp`, `Date` and `DateTime` write the
+  three temporal types, and `timestamps => 'object'` decodes them exactly (SPEC §10),
+  including the 64-bit extremes of date and datetime and a table with date and datetime
+  columns.
+- **Packaging:** `.gitattributes` keeps tests/, bench/, stubs/, .github/ and the tool
+  configuration out of the dist archive: 56 KB zipped instead of 120 KB.
+- **Tests:** the vendored conformance vectors are spec 0.3's (311), including eight
+  lz4-block vectors, which pass with ext-lz4 0.8.0 and liblz4 1.10.0; the LZ4 block check is
+  also tested without the extension, and against what ext-lz4 compresses. The harness compared
+  the date and datetime vectors at their 64-bit extremes with arithmetic that overflowed
+  into floats; it now uses floor division. New tests time keys that share one hash against
+  ordinary keys (wide tables, empty tables, both key caches), check that wide-table rows
+  hold no PHP references, and check what `git archive` ships.
+
 ## 0.2.0 (2026-11-14)
 
 Implements BTOON spec 0.2 (`BTOON\SPEC_VERSION` is now `'0.2'`; decisions D23–D26 in the

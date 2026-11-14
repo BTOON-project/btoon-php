@@ -42,8 +42,9 @@ final class ReferenceCasesTest extends TestCase
             $bytes = encode($value);
             self::assertSame($case->length, \strlen($bytes));
             self::assertSame($case->sha256, hash('sha256', $bytes));
-            // Decoding and re-encoding must reproduce the canonical bytes.
-            self::assertSame($bytes, encode(decode($bytes, ['binary_as_object' => true])));
+            // Decoding and re-encoding must reproduce the canonical bytes. The large containers
+            // include a map of 65,536 entries, over the default max_map_entries.
+            self::assertSame($bytes, encode(decode($bytes, ['binary_as_object' => true, 'max_map_entries' => (int) $case->n])));
 
             return;
         }

@@ -8,6 +8,7 @@ use BTOON\BtoonException;
 use BTOON\Compression;
 use BTOON\DecodeOptions;
 use BTOON\EncodeOptions;
+use BTOON\Internal\Codec;
 use BTOON\Internal\ZstdFrame;
 use BTOON\Tests\Support\Vectors;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -34,6 +35,19 @@ final class EnvelopeTest extends TestCase
     private static function envelope(int $algorithm, string $payload, int $size, int $version = 1, int $reserved = 0, ?int $compressed = null): string
     {
         return 'BTON' . pack('CCnNN', $version, $algorithm, $reserved, $compressed ?? \strlen($payload), $size) . $payload;
+    }
+
+    /**
+     * One LZ4 sequence (lz4_Block_format.md): literals, then a match of $matchLength bytes
+     * from $offset bytes back, or no match when $offset is null.
+     */
+    private static function lz4Sequence(string $literals, ?int $offset = null, int $matchLength = 4): string
+    {
+        $length = static fn (int $n): string => $n < 15 ? '' : str_repeat("\xff", intdiv($n - 15, 255)) . \chr(($n - 15) % 255);
+        $match = $offset === null ? 0 : $matchLength - 4;
+        $sequence = \chr(min(\strlen($literals), 15) << 4 | min($match, 15)) . $length(\strlen($literals)) . $literals;
+
+        return $offset === null ? $sequence : $sequence . pack('v', $offset) . $length($match);
     }
 
     // --- Compression --------------------------------------------------------------------
@@ -286,6 +300,109 @@ final class EnvelopeTest extends TestCase
         }
         if (!Compression::Lz4->isAvailable() && !Compression::Snappy->isAvailable()) {
             self::markTestSkipped('needs ext-lz4 (>= 0.8) or ext-snappy');
+        }
+    }
+
+    /** @return iterable<string, array{string, int, bool}> */
+    public static function lz4Blocks(): iterable
+    {
+        // A block without a match is one run of literals, valid at any length.
+        foreach ([0, 1, 4, 5, 14, 15, 16, 269, 270, 271, 525, 1000] as $n) {
+            $block = self::lz4Sequence(str_repeat('x', $n));
+            yield "$n literals" => [$block, $n, true];
+            yield "$n literals, size + 1" => [$block, $n + 1, false];
+            if ($n > 0) {
+                yield "$n literals, size - 1" => [$block, $n - 1, false];
+            }
+        }
+        $typical = self::lz4Sequence('abcdefgh', 8, 20) . self::lz4Sequence(str_repeat('z', 12));
+        yield 'literals, a match, literals' => [$typical, 40, true];
+        yield 'a long overlapping match' => [self::lz4Sequence('a', 1, 300) . self::lz4Sequence('bbbbb'), 306, true];
+        yield 'offset back to the first byte' => [self::lz4Sequence('abcd', 4, 4) . self::lz4Sequence(str_repeat('z', 12)), 20, true];
+        yield 'offset 0' => [self::lz4Sequence('abcd', 0, 4) . self::lz4Sequence(str_repeat('z', 12)), 20, false];
+        yield 'offset before the start' => [self::lz4Sequence('abcd', 5, 4) . self::lz4Sequence(str_repeat('z', 12)), 20, false];
+        // A match starts at least 12 bytes before the end and ends at least 5 before it.
+        yield 'match 12 bytes before the end' => [self::lz4Sequence('ab', 1, 4) . self::lz4Sequence(str_repeat('c', 8)), 14, true];
+        yield 'match 11 bytes before the end' => [self::lz4Sequence('ab', 1, 4) . self::lz4Sequence(str_repeat('c', 7)), 13, false];
+        yield '5 literals after the match' => [self::lz4Sequence('ab', 1, 7) . self::lz4Sequence('ccccc'), 14, true];
+        yield '4 literals after the match' => [self::lz4Sequence('ab', 1, 10) . self::lz4Sequence('cccc'), 16, false];
+        yield 'ends with a match' => [self::lz4Sequence(str_repeat('a', 20), 1, 4), 32, false];
+        yield 'ends with a match and an empty sequence' => [self::lz4Sequence(str_repeat('a', 20), 1, 4) . "\x00", 24, false];
+        // The final token's match-length bits are ignored, also in an empty block.
+        yield 'match bits in the final token' => ["\x5f" . 'aaaaa', 5, true];
+        yield 'empty, match bits set' => ["\x0f", 0, true];
+        yield 'no block' => ['', 0, false];
+        yield 'a byte after the block' => [$typical . "\x00", 40, false];
+        yield 'literal length past the input' => ["\xf0\xff\xff\xff" . 'abc', 800, false];
+        yield 'match length cut off' => ["\x4f" . 'aaaa' . "\x01\x00", 100, false];
+        yield 'offset cut off' => ["\x40" . 'aaaa' . "\x01", 100, false];
+        for ($cut = 1; $cut < \strlen($typical); ++$cut) {
+            yield "first $cut bytes of a block" => [substr($typical, 0, $cut), 40, false];
+        }
+    }
+
+    /**
+     * SPEC §6: an LZ4 block must be valid under the block format, end-of-block conditions
+     * included, and no match offset may be 0 or reach back before the start of the output.
+     * liblz4, which ext-lz4 uses, skips some of these checks on its fast path, so the block's
+     * structure is checked before ext-lz4 decodes it. The check needs no extension.
+     */
+    #[DataProvider('lz4Blocks')]
+    public function testLz4BlockStructure(string $block, int $size, bool $valid): void
+    {
+        try {
+            Codec::checkLz4Block($block, $size);
+            self::assertTrue($valid, 'accepted');
+        } catch (BtoonException $e) {
+            self::assertFalse($valid, $e->getMessage());
+            self::assertSame('invalid_envelope', $e->errorCode);
+        }
+    }
+
+    /** Every lz4-block vector, through the structure check alone. */
+    public function testLz4BlockVectorsWithoutTheExtension(): void
+    {
+        $checked = 0;
+        foreach (Vectors::all() as $vector) {
+            if (!str_starts_with((string) $vector->id, 'lz4-block/')) {
+                continue;
+            }
+            $bytes = Vectors::bytes($vector);
+            /** @var array{1: int} $size */
+            $size = unpack('N', $bytes, 12);
+            try {
+                Codec::checkLz4Block(substr($bytes, 16), $size[1]);
+                self::assertFalse(isset($vector->error), "$vector->id: accepted");
+            } catch (BtoonException $e) {
+                self::assertSame($vector->error ?? null, $e->errorCode, "$vector->id: {$e->getMessage()}");
+            }
+            ++$checked;
+        }
+        self::assertSame(8, $checked);
+    }
+
+    /** What LZ4 compressors write always passes the structure check (needs ext-lz4). */
+    public function testLz4CompressorOutputPassesTheStructureCheck(): void
+    {
+        if (!Compression::Lz4->isAvailable()) {
+            self::markTestSkipped('needs ext-lz4 (>= 0.8)');
+        }
+        mt_srand(11);
+        $inputs = [encode(self::document(300)), str_repeat('a', 100_000), str_repeat("\x00\x01\x02", 30_000)];
+        for ($i = 0; $i < 300; ++$i) {
+            $input = '';
+            $length = mt_rand(1, $i < 250 ? 300 : 20_000);
+            while (\strlen($input) < $length) {
+                $input .= mt_rand(0, 2) === 0 ? random_bytes(mt_rand(1, 20)) : str_repeat(\chr(mt_rand(97, 100)), mt_rand(1, 40));
+            }
+            $inputs[] = substr($input, 0, $length);
+        }
+        foreach ($inputs as $input) {
+            foreach ([0, 9, 12] as $level) {
+                $block = (string) lz4_compress_raw($input, $level);
+                Codec::checkLz4Block($block, \strlen($input));
+                self::assertSame($input, Codec::decompress(Compression::Lz4, $block, \strlen($input)));
+            }
         }
     }
 

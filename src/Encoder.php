@@ -51,7 +51,13 @@ final class Encoder
     private const DEFINED_EXT_TYPES = [-1 => 'Timestamp', -2 => 'Date', -3 => 'DateTime', -4 => 'BigInt',
         -5 => 'VectorF32', -6 => 'VectorF64', -10 => 'tabular arrays'];
 
-    private const KEY_CACHE_LIMIT = 4096;
+    /**
+     * Encoded map keys are remembered, up to this many. The cache is a PHP array keyed by the
+     * map keys, which can be chosen to share one hash, so its size also bounds the collision
+     * chain a lookup walks: at 4096, re-encoding 1,023 decoded maps of 1,024 such keys took
+     * 6.8 s instead of 0.4 s. A few dozen keys cover typical records.
+     */
+    private const KEY_CACHE_LIMIT = 64;
 
     private readonly EncodeOptions $options;
     private readonly int $maxDepth;
