@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace BTOON\Tests;
 
+use BTOON\BTOON;
 use BTOON\BtoonException;
 use BTOON\DecodeOptions;
 use BTOON\MapMode;
@@ -16,6 +17,7 @@ use function BTOON\decode;
 use function BTOON\encode;
 
 use const BTOON\SPEC_VERSION;
+use const BTOON\VERSION;
 
 /**
  * Runs the conformance vectors as SPEC §10 and IMPLEMENTATION-GUIDE §1 require:
@@ -70,6 +72,9 @@ final class ConformanceTest extends TestCase
     {
         $document = Vectors::document();
         self::assertSame(SPEC_VERSION, $document->spec);
+        self::assertSame(SPEC_VERSION, BTOON::SPEC_VERSION);
+        self::assertSame(VERSION, BTOON::VERSION);
+        self::assertStringStartsWith(SPEC_VERSION . '.', VERSION); // SPEC §12: 0.N.x implements 0.N
         $defaults = new DecodeOptions();
         self::assertSame($defaults->maxDepth, $document->defaults->max_depth);
         self::assertSame($defaults->strict, $document->defaults->strict);

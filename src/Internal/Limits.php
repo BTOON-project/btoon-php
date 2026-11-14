@@ -37,6 +37,16 @@ final class Limits
     public const MAX_DECOMPRESSED_SIZE = 67_108_864;
     /** SPEC §7: no `max_depth` above this. */
     public const MAX_DEPTH = 1000;
+    /**
+     * PHP's own default for `max_map_entries`: the most entries a map, or columns a table,
+     * may have. PHP hashes array keys with DJBX33A and no secret seed, so keys can be chosen
+     * to share one hash, and then adding n of them to one array compares about n²/2 keys.
+     * With at most this many entries per map, each entry costs at most this many comparisons,
+     * so decoding stays linear in `max_values`. A lower cap would be cheaper still, but would
+     * reject ordinary documents that every other BTOON library decodes, such as a few
+     * thousand entries keyed by id. The worst case is in the README's "Map size" section.
+     */
+    public const MAX_MAP_ENTRIES = 4096;
 
     /** The default `max_values` is at most `memory_limit / 2^10`. */
     private const VALUES_SHIFT = 10;

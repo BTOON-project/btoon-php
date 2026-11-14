@@ -136,14 +136,27 @@ final class LimitsTest extends TestCase
         $this->assertDecodeError('size_limit', $two, ['max_values' => 2], 'max_values');
     }
 
-    /** @return iterable<string, array{list<string>, string}> */
+    /** @return iterable<string, array{list<string>, string, int}> */
     public static function columnNames(): iterable
     {
-        yield 'duplicate before invalid UTF-8' => [['a', 'a', "\xff"], 'invalid_tabular'];
-        yield 'invalid UTF-8 before duplicate' => [["\xff", 'a', 'a'], 'invalid_utf8'];
-        yield 'invalid UTF-8 between duplicates' => [['a', "\xff", 'a'], 'invalid_utf8'];
-        yield 'duplicate of the first name' => [['a', 'b', 'a'], 'invalid_tabular'];
-        yield 'names a replacing decoder would merge' => [["\xff", "\xfe", 'c'], 'invalid_utf8'];
+        $cases = [
+            'duplicate before invalid UTF-8' => [['a', 'a', "\xff"], 'invalid_tabular'],
+            'invalid UTF-8 before duplicate' => [["\xff", 'a', 'a'], 'invalid_utf8'],
+            'invalid UTF-8 between duplicates' => [['a', "\xff", 'a'], 'invalid_utf8'],
+            'duplicate of the first name' => [['a', 'b', 'a'], 'invalid_tabular'],
+            'names a replacing decoder would merge' => [["\xff", "\xfe", 'c'], 'invalid_utf8'],
+            'integer-like duplicate' => [['7', 'x', '7'], 'invalid_tabular'],
+            'integer-like names that differ' => [['1', '01', '1'], 'invalid_tabular'],
+        ];
+        // A table wider than 16 columns builds its rows from a template, and a table without
+        // rows compares digests of its names: each finds duplicates its own way.
+        $filler = array_map(static fn (int $i): string => sprintf('f%02d', $i), range(0, 15));
+        foreach ($cases as $case => [$names, $code]) {
+            foreach ([1, 0] as $rows) {
+                yield "$case, $rows rows" => [$names, $code, $rows];
+                yield "$case, $rows rows, wide" => [[...$filler, ...$names], $code, $rows];
+            }
+        }
     }
 
     /**
@@ -153,11 +166,65 @@ final class LimitsTest extends TestCase
      * @param list<string> $names
      */
     #[DataProvider('columnNames')]
-    public function testColumnNamesAreCheckedFrontToBack(array $names, string $code): void
+    public function testColumnNamesAreCheckedFrontToBack(array $names, string $code, int $rows): void
     {
-        $table = self::table(1, $names, ["\xc0", "\xc0", "\xc0"]);
+        $table = self::table($rows, $names, array_fill(0, \count($names), str_repeat("\xc0", $rows)));
         $this->assertDecodeError($code, $table);
         $this->assertDecodeError($code, $table, ['strict' => false]);
+        // Without the bad names, the same table decodes.
+        $good = array_values(array_unique(array_filter($names, static fn (string $name): bool => preg_match('//u', $name) === 1)));
+        $decoded = decode((string) hex2bin(self::table($rows, $good, array_fill(0, \count($good), str_repeat("\xc0", $rows)))));
+        self::assertIsArray($decoded);
+        self::assertCount($rows, $decoded);
+    }
+
+    /**
+     * A map may have at most max_map_entries entries, and a table at most that many columns:
+     * PHP's arrays hash keys without a secret seed, so keys can be chosen to collide, and then
+     * every key added to a map is compared with all the keys before it (review 2026-11-13).
+     * The default is 4096; more raises size_limit, after the announced count has been checked
+     * against the input (truncated).
+     */
+    public function testMaxMapEntries(): void
+    {
+        self::assertSame(4096, DecodeOptions::DEFAULT_MAX_MAP_ENTRIES);
+        self::assertSame(4096, (new DecodeOptions())->maxMapEntries);
+        self::assertSame(4096, DecodeOptions::fromArray([])->maxMapEntries);
+        self::assertSame(7, DecodeOptions::fromArray(['max_map_entries' => 7])->maxMapEntries);
+        self::assertSame(7, (new Decoder(new DecodeOptions(maxMapEntries: 7)))->getOptions()->maxMapEntries);
+
+        // The default: 4,096 entries decode, 4,097 don't, and the message says how to change that.
+        $map = static function (int $entries): string {
+            $hex = $entries <= 15 ? dechex(0x80 | $entries) : 'de' . sprintf('%04x', $entries);
+            for ($i = 0; $i < $entries; ++$i) {
+                $hex .= bin2hex(sprintf("\xa5k%04d", $i)) . 'c0';
+            }
+
+            return $hex;
+        };
+        self::assertCount(4096, (array) decode((string) hex2bin($map(4096))));
+        $this->assertDecodeError('size_limit', $map(4097), [], 'a map of 4097 entries exceeds the max_map_entries option (4096); raise it');
+        self::assertCount(4097, (array) decode((string) hex2bin($map(4097)), ['max_map_entries' => 4097]));
+
+        // Set explicitly, also for nested maps and with every map an ArrayObject.
+        self::assertSame(['a' => 1, 'b' => 2], decode((string) hex2bin('82a16101a16202'), ['max_map_entries' => 2]));
+        $this->assertDecodeError('size_limit', '83a16101a16202a16303', ['max_map_entries' => 2]);
+        $this->assertDecodeError('size_limit', '9181a16183a161c0a162c0a163c0', ['max_map_entries' => 2]);
+        $this->assertDecodeError('size_limit', '83a16101a16202a16303', ['max_map_entries' => 2, 'maps' => 'object']);
+        $this->assertDecodeError('size_limit', '81a16101', ['max_map_entries' => 0]);
+        self::assertEquals(new \ArrayObject(), decode("\x80", ['max_map_entries' => 0]));
+        // In non-strict mode too, which counts entries, not distinct keys.
+        $this->assertDecodeError('size_limit', '83a16101a16102a16103', ['max_map_entries' => 2, 'strict' => false]);
+
+        // A table's rows are maps of its columns, with or without rows.
+        $three = self::table(2, ['a', 'b', 'c'], ["\x01\x02", "\x03\x04", "\x05\x06"]);
+        self::assertSame([['a' => 1, 'b' => 3, 'c' => 5], ['a' => 2, 'b' => 4, 'c' => 6]], decode((string) hex2bin($three), ['max_map_entries' => 3]));
+        $this->assertDecodeError('size_limit', $three, ['max_map_entries' => 2], 'a table of 3 columns exceeds the max_map_entries option (2)');
+        $this->assertDecodeError('size_limit', self::table(0, ['a', 'b', 'c'], ['', '', '']), ['max_map_entries' => 2]);
+
+        // The announced count is checked against the input first.
+        $this->assertDecodeError('truncated', 'dfffffffff', ['max_map_entries' => 2]);
+        $this->assertDecodeError('invalid_tabular', 'c70cf6' . '00000001' . '0000ffff' . '00000000', ['max_map_entries' => 2]);
     }
 
     /**

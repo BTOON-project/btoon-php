@@ -18,8 +18,10 @@ use BTOON\ErrorCode;
  * - zlib (ext-zlib, required): incremental inflate with input fed in slices small
  *   enough that one slice can't inflate far past the declared size. (gzuncompress()
  *   is not used: its max_length can be exceeded and it ignores trailing bytes.)
- * - LZ4 (ext-lz4 >= 0.8): the raw block API, whose output buffer is exactly the
- *   declared size.
+ * - LZ4 (ext-lz4 >= 0.8): the block's structure is checked here first, as SPEC §6 requires
+ *   (see {@see checkLz4Block()}), then the raw block API decodes it into a buffer of
+ *   exactly the declared size. liblz4, which ext-lz4 uses, skips the end-of-block and
+ *   offset-0 checks on its fast path, so it accepts some blocks that SPEC §6 rejects.
  * - Zstandard (ext-zstd >= 0.15): the frame structure is validated here first (one
  *   frame, no dictionary, matching content size, window at most
  *   max(8 MiB, min(size, 128 MiB))), then the frame is fed block by block to the
@@ -39,6 +41,12 @@ final class Codec
     /** LZ4 expands at most ~255:1; LZ4_MAX_INPUT_SIZE. */
     private const LZ4_MAX_RATIO = 255;
     private const LZ4_MAX_SIZE = 0x7E000000;
+    /** LZ4 block format: a match copies at least 4 bytes. */
+    private const LZ4_MIN_MATCH = 4;
+    /** LZ4 block format: the last 5 bytes of output are literals. */
+    private const LZ4_LAST_LITERALS = 5;
+    /** LZ4 block format: a match starts at least 12 bytes before the end of the output. */
+    private const LZ4_MATCH_LIMIT = 12;
     /** Snappy expands at most ~32:1. */
     private const SNAPPY_MAX_RATIO = 32;
 
@@ -148,12 +156,11 @@ final class Codec
         if ($size > self::LZ4_MAX_SIZE || $size > \strlen($payload) * self::LZ4_MAX_RATIO + 16) {
             throw self::corrupt('lz4', sprintf('declares an impossible decompressed size of %d bytes', $size));
         }
+        self::checkLz4Block($payload, $size);
         if ($size === 0) {
-            // ext-lz4 rejects a zero output size; the only empty LZ4 block is a single zero token.
-            if ($payload === "\x00") {
-                return '';
-            }
-            throw self::sizeMismatch('lz4', -1, 0);
+            // A single token without literals, which ext-lz4 can't decode: it refuses an
+            // output size of 0.
+            return '';
         }
         [$output, $warning] = self::quietly(static fn (): string|false => lz4_uncompress_raw($payload, $size));
         if (!\is_string($output)) {
@@ -164,6 +171,99 @@ final class Codec
         }
 
         return $output;
+    }
+
+    /**
+     * Checks an LZ4 block (lz4_Block_format.md) without decoding it, as SPEC §6 requires,
+     * and raises `invalid_envelope` unless it decodes to exactly $size bytes and meets the
+     * block format's rules:
+     *
+     * - the block is a series of sequences, each literals and then a match, except the
+     *   last, which holds only literals and ends exactly at the end of the payload (its
+     *   token's match-length bits are ignored);
+     * - every match offset is at least 1 and reaches back at most to the start of the output;
+     * - every match starts at least 12 bytes before the end of the output and ends at least
+     *   5 bytes before it, so the last 5 bytes are literals. A block without a match is a
+     *   single run of literals, valid at any length.
+     *
+     * liblz4 skips the last two checks for a sequence it copies on its fast path, which it
+     * takes while at least 32 bytes of output remain, so it accepts some blocks that end
+     * with a match or use offset 0. No LZ4 compressor writes such blocks. Only the
+     * positions are tracked here, so this costs one pass over the sequences.
+     *
+     * @param non-negative-int $size
+     *
+     * @throws BtoonException
+     */
+    public static function checkLz4Block(string $payload, int $size): void
+    {
+        $length = \strlen($payload);
+        $in = 0;
+        $out = 0;
+        // The last output positions where a match may start and end.
+        $lastMatchStart = $size - self::LZ4_MATCH_LIMIT;
+        $lastMatchEnd = $size - self::LZ4_LAST_LITERALS;
+        while (true) {
+            if ($in === $length) {
+                // Reached only at the start or after a match: a literals-only sequence that
+                // ends the payload ends the loop below.
+                throw self::corrupt('lz4', $length === 0 ? 'is empty' : 'ends with a match instead of a sequence of literals only');
+            }
+            $token = \ord($payload[$in++]);
+            $literals = $token >> 4;
+            if ($literals === 15) {
+                do {
+                    if ($in === $length) {
+                        throw self::corrupt('lz4', 'is truncated');
+                    }
+                    $byte = \ord($payload[$in++]);
+                    $literals += $byte;
+                } while ($byte === 255 && $literals <= $length);
+            }
+            if ($literals !== 0) {
+                if ($literals > $length - $in) {
+                    throw self::corrupt('lz4', 'is truncated');
+                }
+                if ($literals > $size - $out) {
+                    throw self::corrupt('lz4', sprintf('decompresses to more than the declared %d bytes', $size));
+                }
+                $in += $literals;
+                $out += $literals;
+            }
+            if ($in === $length) {
+                break;
+            }
+
+            // A match follows the literals.
+            if ($out > $lastMatchStart) {
+                throw self::corrupt('lz4', 'has a match that starts less than 12 bytes before the end of the output');
+            }
+            if ($length - $in < 2) {
+                throw self::corrupt('lz4', 'is truncated');
+            }
+            $offset = \ord($payload[$in]) | (\ord($payload[$in + 1]) << 8);
+            $in += 2;
+            if ($offset === 0 || $offset > $out) {
+                throw self::corrupt('lz4', sprintf('has a match offset of %d after %d bytes of output', $offset, $out));
+            }
+            $match = $token & 15;
+            if ($match === 15) {
+                do {
+                    if ($in === $length) {
+                        throw self::corrupt('lz4', 'is truncated');
+                    }
+                    $byte = \ord($payload[$in++]);
+                    $match += $byte;
+                } while ($byte === 255 && $match <= $size);
+            }
+            $out += $match + self::LZ4_MIN_MATCH;
+            if ($out > $lastMatchEnd) {
+                throw self::corrupt('lz4', 'has a match that ends less than 5 bytes before the end of the output');
+            }
+        }
+        if ($out !== $size) {
+            throw self::sizeMismatch('lz4', $out, $size);
+        }
     }
 
     /** @param non-negative-int $size */

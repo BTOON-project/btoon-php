@@ -17,6 +17,7 @@ use BTOON\Internal\Options;
  * | `max_depth`             | `maxDepth`            | 128        | nesting limit, at most 1000                          |
  * | `max_decompressed_size` | `maxDecompressedSize` | 64 MiB *   | limit for compression envelopes and table keys       |
  * | `max_values`            | `maxValues`           | 2^20 *     | how many values a document may decode to             |
+ * | `max_map_entries`       | `maxMapEntries`       | 4096       | most entries in one map, or columns in one table     |
  * | `auto_decompress`       | `autoDecompress`      | true       | accept compression envelopes                         |
  * | `hmac_key`              | `hmacKey`             | null       | require and verify a signed envelope (SPEC §8)       |
  * | `timestamps`            | `timestamps`          | 'datetime' | `'datetime'` → `\DateTimeImmutable`, `'object'` → value objects |
@@ -40,6 +41,12 @@ use BTOON\Internal\Options;
  * `max_decompressed_size` at most `memory_limit / 8`. With `memory_limit = 128M` they are
  * 131,072 values and 16 MiB; from 1G, and with no limit, SPEC's 2^20 and 64 MiB. The
  * properties hold the values in effect, and explicit values are used as given.
+ *
+ * `max_map_entries` is PHP's own limit, not SPEC's: a map with more entries, or a table with
+ * more columns (its rows are maps), raises `size_limit`. PHP hashes array keys without a
+ * secret seed, so keys can be chosen to share one hash, and then every key added to a map
+ * is compared with every key already in it. The limit keeps the cost linear in `max_values`
+ * (see the README's "Map size" section for the worst case). Raise it to decode larger maps.
  */
 final readonly class DecodeOptions
 {
@@ -50,10 +57,12 @@ final readonly class DecodeOptions
     public const DEFAULT_MAX_DECOMPRESSED_SIZE = Limits::MAX_DECOMPRESSED_SIZE;
     /** SPEC's default `max_values`, before the `memory_limit` adjustment. */
     public const DEFAULT_MAX_VALUES = Limits::MAX_VALUES;
+    /** The default `max_map_entries` (PHP's own limit, against hash collisions). */
+    public const DEFAULT_MAX_MAP_ENTRIES = Limits::MAX_MAP_ENTRIES;
 
     private const KEYS = [
-        'strict', 'max_depth', 'max_decompressed_size', 'max_values', 'auto_decompress', 'hmac_key', 'timestamps',
-        'binary_as_object', 'maps',
+        'strict', 'max_depth', 'max_decompressed_size', 'max_values', 'max_map_entries', 'auto_decompress', 'hmac_key',
+        'timestamps', 'binary_as_object', 'maps',
     ];
 
     /** @var non-negative-int bytes; envelopes declaring more, and larger table keys, raise `size_limit` */
@@ -66,6 +75,7 @@ final readonly class DecodeOptions
      * @param non-negative-int      $maxDepth            at most {@see MAX_DEPTH_LIMIT}
      * @param non-negative-int|null $maxDecompressedSize bytes; null for the default
      * @param non-negative-int|null $maxValues           null for the default
+     * @param non-negative-int      $maxMapEntries       entries per map, columns per table
      */
     public function __construct(
         public bool $strict = true,
@@ -77,6 +87,7 @@ final readonly class DecodeOptions
         public bool $binaryAsObject = false,
         public MapMode $maps = MapMode::Auto,
         ?int $maxValues = null,
+        public int $maxMapEntries = self::DEFAULT_MAX_MAP_ENTRIES,
     ) {
         // Runtime checks: callers without static analysis can pass anything.
         Options::maxDepth($maxDepth);
@@ -86,6 +97,7 @@ final readonly class DecodeOptions
         if ($maxValues !== null) {
             Options::assertNonNegative('max_values', $maxValues);
         }
+        Options::assertNonNegative('max_map_entries', $maxMapEntries);
         Options::assertKey($hmacKey);
         $this->maxDecompressedSize = $maxDecompressedSize ?? Limits::defaultMaxDecompressedSize();
         $this->maxValues = $maxValues ?? Limits::defaultMaxValues();
@@ -103,6 +115,7 @@ final readonly class DecodeOptions
         $maxDepth = self::DEFAULT_MAX_DEPTH;
         $maxSize = null;
         $maxValues = null;
+        $maxMapEntries = self::DEFAULT_MAX_MAP_ENTRIES;
         $autoDecompress = true;
         $hmacKey = null;
         $timestamps = TimestampMode::DateTime;
@@ -121,6 +134,9 @@ final readonly class DecodeOptions
                     break;
                 case 'max_values':
                     $maxValues = Options::limit($name, $value);
+                    break;
+                case 'max_map_entries':
+                    $maxMapEntries = Options::nonNegativeInt($name, $value);
                     break;
                 case 'auto_decompress':
                     $autoDecompress = Options::bool($name, $value);
@@ -142,6 +158,17 @@ final readonly class DecodeOptions
             }
         }
 
-        return new self($strict, $maxDepth, $maxSize, $autoDecompress, $hmacKey, $timestamps, $binaryAsObject, $maps, $maxValues);
+        return new self(
+            $strict,
+            $maxDepth,
+            $maxSize,
+            $autoDecompress,
+            $hmacKey,
+            $timestamps,
+            $binaryAsObject,
+            $maps,
+            $maxValues,
+            $maxMapEntries,
+        );
     }
 }

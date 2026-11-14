@@ -82,6 +82,18 @@ final class BigIntMath
         return $start > 0 ? substr($bytes, $start) : $bytes;
     }
 
+    /** The number of bits in the magnitude of two's-complement big-endian bytes (0 for zero). */
+    public static function bitLength(string $bytes): int
+    {
+        [, $magnitude] = self::toSignMagnitude($bytes);
+        $magnitude = ltrim($magnitude, "\x00");
+        if ($magnitude === '') {
+            return 0;
+        }
+
+        return (\strlen($magnitude) - 1) * 8 + \strlen(decbin(\ord($magnitude[0])));
+    }
+
     public static function intToBytes(int $value): string
     {
         return self::minimal(pack('J', $value));

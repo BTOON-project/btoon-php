@@ -19,7 +19,8 @@ use BTOON\Internal\Runtime;
  * are rejected (strict mode), and compression envelopes are size-limited before and
  * during decompression. A document decodes to at most `max_values` values, and a table's
  * rows × column-name bytes stay within `max_decompressed_size` (SPEC §7.1), which bounds
- * the memory a decoded document takes.
+ * the memory a decoded document takes. No map has more than `max_map_entries` entries, and
+ * no table more columns, which bounds the time keys chosen to share one PHP hash can cost.
  *
  * PHP type mapping:
  * - nil, bool, float → `null`, `bool`, `float`
@@ -44,7 +45,23 @@ use BTOON\Internal\Runtime;
  */
 final class Decoder
 {
-    private const KEY_CACHE_LIMIT = 4096;
+    /**
+     * Keys validated as UTF-8 are remembered, up to this many. The cache is a PHP array keyed
+     * by untrusted strings, which can be chosen to share one hash, so its size also bounds
+     * the collision chain a lookup walks; it was 4096, which made 131,072 one-entry maps take
+     * 0.7 s instead of 0.04 s (review 2026-11-13). A few dozen keys cover typical records.
+     */
+    private const KEY_CACHE_LIMIT = 64;
+
+    /**
+     * Tables up to this wide set each cell into its row by name: even when the names share one
+     * hash, that compares at most this many keys per cell. Wider tables copy a template row
+     * instead, which never hashes a name again; for narrow tables it is slower (20 to 40%).
+     */
+    private const NARROW_TABLE_COLUMNS = 16;
+
+    /** Random per process, so that nobody can choose column names whose digests collide. */
+    private static ?string $digestKey = null;
 
     private readonly DecodeOptions $options;
     private readonly bool $strict;
@@ -60,6 +77,8 @@ final class Decoder
     private readonly int $maxValues;
     /** A table's rows × column-name bytes may not exceed this (`max_decompressed_size`). */
     private readonly int $maxNameBytes;
+    /** The most entries a map, or columns a table, may have (`max_map_entries`). */
+    private readonly int $maxMapEntries;
 
     private string $data = '';
     private int $pos = 0;
@@ -83,6 +102,7 @@ final class Decoder
         $this->mbstring = \function_exists('mb_check_encoding');
         $this->maxValues = $this->options->maxValues;
         $this->maxNameBytes = $this->options->maxDecompressedSize;
+        $this->maxMapEntries = $this->options->maxMapEntries;
     }
 
     public function getOptions(): DecodeOptions
@@ -235,16 +255,21 @@ final class Decoder
         if ($count > ($this->end - $this->pos) >> 1) {
             throw $this->truncated(sprintf('a map of %d entries', $count));
         }
+        if ($count > $this->maxMapEntries) {
+            throw $this->tooManyEntries(sprintf('a map of %d entries', $count));
+        }
         /** @var array<array-key, mixed> $map integer-like keys become int keys */
         $map = [];
         for ($i = 0; $i < $count; ++$i) {
             $at = $this->pos;
             $key = $this->key();
-            $value = $this->value($depth + 1);
-            if ($this->strict && \array_key_exists($key, $map)) {
+            // One hash lookup per entry: a key that was already there leaves the count as it
+            // was. Colliding keys make each lookup walk the whole map, so a map costs up to
+            // count² steps, which max_map_entries bounds.
+            $map[$key] = $this->value($depth + 1);
+            if ($this->strict && \count($map) === $i) {
                 throw $this->error(ErrorCode::DuplicateKey, sprintf('duplicate map key %s', self::quote($key)), $at);
             }
-            $map[$key] = $value;
         }
         if ($this->mapObjects || ($this->listLikeMapObjects && array_is_list($map))) {
             return new \ArrayObject($map);
@@ -415,11 +440,23 @@ final class Decoder
         if ($columns > intdiv($end - $p, 9)) {
             throw $this->badTable(sprintf('%d columns do not fit in the payload', $columns));
         }
+        // The rows are maps with one entry per column.
+        if ($columns > $this->maxMapEntries) {
+            throw $this->tooManyEntries(sprintf('a table of %d columns', $columns));
+        }
 
         // Names are checked front to back (SPEC §5.6.3): each must be UTF-8, in non-strict
         // mode too, and differ from every earlier name. The first name that fails sets the error.
+        // A table with rows keeps its names as the keys of a template row, which finds
+        // duplicates with one hash lookup per name. Names chosen to share one hash cost
+        // columns² steps there, once per table; its cells, which count against max_values,
+        // pay for that, and a wide table's rows are copies of the template. A table without
+        // rows has no cells, so it compares keyed digests of its names, which can't be chosen
+        // to collide: otherwise a few MB of empty tables would take seconds.
         $names = [];
-        $seen = [];
+        /** @var array<array-key, null> $template integer-like names become int keys */
+        $template = [];
+        $digests = [];
         $nameBytes = 0;
         for ($c = 0; $c < $columns; ++$c) {
             if ($end - $p < 4) {
@@ -435,10 +472,16 @@ final class Decoder
                 $this->pos = $p;
                 throw $this->error(ErrorCode::InvalidUtf8, 'tabular column name is not valid UTF-8');
             }
-            if (isset($seen[$name])) {
+            if ($rows > 0) {
+                $template[$name] = null;
+                $duplicate = \count($template) === $c; // the name was already there
+            } else {
+                $digests[md5(self::digestKey() . $name, true)] = true;
+                $duplicate = \count($digests) === $c;
+            }
+            if ($duplicate) {
                 throw $this->badTable(sprintf('duplicate column name %s', self::quote($name)));
             }
-            $seen[$name] = true;
             $names[] = $name;
             $nameBytes += $length;
             $p += $length;
@@ -469,13 +512,17 @@ final class Decoder
             throw $this->tooManyValues();
         }
         $this->valuesLeft -= $rows;
-        // Each row is created once its first cell is decoded. Building all the rows the header
-        // announces up front let nested tables count the same bytes at every level: 64
-        // levels in 1 MiB built 2 GB of empty rows (review 2026-11-13, X1).
+        // A narrow table creates each row with its first cell. A wide one collects its cells
+        // column by column and builds the rows once every column is complete. Building all
+        // the rows the header announces up front let nested tables count the same bytes at
+        // every level: 64 levels in 1 MiB built 2 GB of empty rows (review 2026-11-13, X1).
+        $wide = $columns > self::NARROW_TABLE_COLUMNS;
         /** @var list<array<array-key, mixed>> $table */
         $table = [];
+        /** @var list<list<mixed>> $cells */
+        $cells = [];
         $outerEnd = $this->end;
-        foreach ($names as $column => $name) {
+        foreach ($names as $index => $name) {
             if ($end - $p < 4) {
                 throw $this->badTable('column data is truncated');
             }
@@ -488,7 +535,13 @@ final class Decoder
             $this->pos = $p;
             $this->end = $columnEnd;
             try {
-                if ($column === 0) {
+                if ($wide) {
+                    $column = [];
+                    for ($r = 0; $r < $rows; ++$r) {
+                        $column[] = $this->value($depth + 2);
+                    }
+                    $cells[] = $column;
+                } elseif ($index === 0) {
                     for ($r = 0; $r < $rows; ++$r) {
                         $table[] = [$name => $this->value($depth + 2)];
                     }
@@ -524,26 +577,30 @@ final class Decoder
             throw $this->badTable(sprintf('%d bytes left over after the last column', $end - $p));
         }
         $this->pos = $end;
+
+        if ($wide) {
+            // Each row is a copy of the template, filled in column order. Copying an array
+            // copies its hash index as it is, and the cells are set by position, so no name is
+            // hashed again: with names that share one hash, setting row[name] for every cell
+            // took rows × columns² steps (1,024 columns × 1,023 rows: 1.2 s instead of 0.08 s).
+            // Filling by reference leaves every cell a PHP reference; array_slice() copies the
+            // row without them, keeping its keys, again without hashing a name.
+            for ($r = 0; $r < $rows; ++$r) {
+                $row = $template;
+                $c = 0;
+                foreach ($row as &$cell) {
+                    $cell = $cells[$c++][$r];
+                }
+                unset($cell);
+                $table[] = \array_slice($row, 0, null, true);
+            }
+        }
         // The rows are maps too, each with the column names as its keys, in column order.
-        if ($this->mapObjects || ($this->listLikeMapObjects && $rows > 0 && self::isListLike($names))) {
+        if ($this->mapObjects || ($this->listLikeMapObjects && $rows > 0 && array_is_list($template))) {
             return array_map(static fn (array $row): \ArrayObject => new \ArrayObject($row), $table);
         }
 
         return $table;
-    }
-
-    /**
-     * Whether an array with these keys, in this order, would be a list (PHP turns the keys
-     * "0", "1", … into ints).
-     *
-     * @param list<string> $keys
-     */
-    private static function isListLike(array $keys): bool
-    {
-        /** @var array<array-key, null> $array */
-        $array = array_fill_keys($keys, null);
-
-        return array_is_list($array);
     }
 
     // --- Primitive reads (all bounds-checked) ----------------------------------------
@@ -648,6 +705,11 @@ final class Decoder
         return $this->mbstring ? mb_check_encoding($value, 'UTF-8') : preg_match('//u', $value) === 1;
     }
 
+    private static function digestKey(): string
+    {
+        return self::$digestKey ??= random_bytes(16);
+    }
+
     // --- Errors ---------------------------------------------------------------------
 
     private function error(ErrorCode $code, string $message, ?int $at = null): BtoonException
@@ -680,6 +742,14 @@ final class Decoder
         return $this->error(
             ErrorCode::SizeLimit,
             sprintf('the document decodes to more than max_values (%d) values', $this->maxValues),
+        );
+    }
+
+    private function tooManyEntries(string $what): BtoonException
+    {
+        return $this->error(
+            ErrorCode::SizeLimit,
+            sprintf('%s exceeds the max_map_entries option (%d); raise it to decode larger maps', $what, $this->maxMapEntries),
         );
     }
 

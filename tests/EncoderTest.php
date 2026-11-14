@@ -181,6 +181,39 @@ final class EncoderTest extends TestCase
         $this->expectBtoonError(ErrorCode::InvalidArgument, static fn () => DateTime::fromDateTime(new \DateTimeImmutable('2263-01-01T00:00:00Z')));
     }
 
+    /**
+     * Dates and datetimes are 64-bit counts (SPEC §5.2, §5.3); the vectors date/min, date/max,
+     * datetime/min and datetime/max hold the extremes. fromDateTime() refused instants in
+     * the earliest second of the range, so the earliest date, decoded to a DateTimeImmutable,
+     * couldn't be turned back into a Date.
+     */
+    public function testDateAndDateTimeAtTheInt64Extremes(): void
+    {
+        foreach ([PHP_INT_MIN, PHP_INT_MIN + 1, -1, 0, PHP_INT_MAX] as $count) {
+            $date = new Date($count);
+            self::assertSame('d7fe' . bin2hex(pack('J', $count)), self::hex($date));
+            self::assertEquals($date, decode(encode($date), ['timestamps' => 'object']));
+            // Milliseconds fit in a DateTimeImmutable exactly, so the round trip is lossless.
+            $instant = decode(encode($date));
+            self::assertInstanceOf(\DateTimeImmutable::class, $instant);
+            self::assertSame($count, Date::fromDateTime($instant)->milliseconds);
+
+            $dateTime = new DateTime($count);
+            self::assertSame('d7fd' . bin2hex(pack('J', $count)), self::hex($dateTime));
+            self::assertEquals($dateTime, decode(encode($dateTime), ['timestamps' => 'object']));
+        }
+        // A DateTimeImmutable holds microseconds, truncated towards the past: the latest
+        // datetime comes back 807 ns earlier, and the earliest one is out of range, but the
+        // first whole microsecond after it isn't.
+        self::assertSame(PHP_INT_MAX - 807, DateTime::fromDateTime((new DateTime(PHP_INT_MAX))->toDateTimeImmutable())->nanoseconds);
+        $this->expectBtoonError(ErrorCode::InvalidArgument, static fn () => DateTime::fromDateTime((new DateTime(PHP_INT_MIN))->toDateTimeImmutable()));
+        $earliest = (new \DateTimeImmutable('@-9223372037'))->setTime(0, 12, 43, 145225);
+        self::assertSame(-9223372037, $earliest->getTimestamp());
+        self::assertSame(PHP_INT_MIN + 808, DateTime::fromDateTime($earliest)->nanoseconds);
+        // One millisecond before the earliest date is out of range.
+        $this->expectBtoonError(ErrorCode::InvalidArgument, static fn () => Date::fromDateTime((new Date(PHP_INT_MIN))->toDateTimeImmutable()->modify('-1 millisecond')));
+    }
+
     // --- Objects ------------------------------------------------------------------------
 
     public function testObjectsThatEncodeAsMaps(): void
